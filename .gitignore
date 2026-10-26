@@ -1,0 +1,30 @@
+# 运行环境与构建产物
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# 归档与历史二进制（走 GitHub Release 分发，不进仓库）
+归档/
+
+# 克隆下来做参考的第三方仓库
+repo/
+repo2/
+
+# 本地工作区（项目笔记、缓存）
+.workbuddy/
+
+# 开发目录只放行回归测试，探针、抓取到的页面与响应一律不入库
+_dev/*
+!_dev/test_logic.py
+!_dev/test_login.py
+!_dev/test_layout.py
+!_dev/test_toggle.py
+!_dev/test_closed.py
+!_dev/test_board.py
+!_dev/test_qr.py
+!_dev/test_loc.py
+
+*.log
