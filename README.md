@@ -4,6 +4,10 @@ Windows 桌面端（tkinter）自动签到工具，支持数字码、二维码�
 
 > 仅供学习网络协议与自动化实现。请遵守所在学校与平台的使用规定，不要用于代签等违规场景。
 
+## 下载
+
+在 [Releases](https://github.com/wuyumolisha397-dot/duifene-checkin-helper/releases) 里取 `duifene-checkin-helper-v3.6.exe`，双击即可运行，不需要装 Python。
+
 ## 功能
 
 | 签到类型 | 处理方式 |
