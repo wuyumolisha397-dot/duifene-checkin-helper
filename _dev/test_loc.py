@@ -27,8 +27,9 @@ def fake_post(url, data=None, headers=None, timeout=None, **kw):
         STATE["room_calls"] += 1
         if not STATE["room_ok"]:
             return R(json.dumps({"msg": -1, "msgbox": "获取失败"}), {"msg": -1, "msgbox": "获取失败"})
-        return R(json.dumps({"msg": 1, "msgbox": "获取成功！", "data": [RAW_ROOM]}),
-                 {"msg": 1, "msgbox": "获取成功！", "data": [RAW_ROOM]})
+        rooms = STATE.get("rooms") or [RAW_ROOM]
+        payload = {"msg": 1, "msgbox": "获取成功！", "data": rooms}
+        return R(json.dumps(payload), payload)
     STATE["posts"].append(data)
     return R(json.dumps({"msg": 1, "msgbox": "签到成功"}),
              {"msg": 1, "msgbox": "签到成功"})
@@ -169,8 +170,38 @@ try:
     ok, _ = d.Loop._do(loop, "3", {"ID": "9200"})
     x, y = signin_xy()
     assert ok and near(x, "114.31") and near(y, "22.61"), (x, y)
-    print(f"12 签到页给的中心优先 OK: {x},{y}")
+    print("12 签到页给的中心优先 OK: %s,%s" % (x, y))
 finally:
     d.CI.board = _orig_board
+
+# ── 13) 圆心猜错时，下一次自动换下一个候选（不再对着同一点撞满次数）──
+STATE["rooms"] = [
+    {"RoomID": 4345388632720912, "RoomName": "往往",
+     "Longitude": 114.39525, "Latitude": 22.70155, "Range": 150.0},
+    {"RoomID": 900, "RoomName": "教学楼B",
+     "Longitude": 114.39500, "Latitude": 22.70200, "Range": 150.0},
+]
+MEM.clear()
+MEM["测试课程"] = {"ok_lng": "114.39000000", "ok_lat": "22.70000000",
+                   "ok_at": d.datetime.now().strftime(d.DATE_FMT)}
+d.CI._rooms.clear(); loop._bc = None
+_ob = d.CI.board
+d.CI.board = lambda cid: {}
+try:
+    info = {"ID": "9300"}
+    seen = []
+    for _ in range(3):
+        d.Loop._do(loop, "3", info)
+        seen.append(loop._last_loc[:2])
+    print("13 依次换圆心:", " -> ".join("%s,%s" % p for p in seen))
+    assert len(set(seen)) == 3, seen                      # 三次三个不同点
+    assert near(seen[0][0], "114.39"), seen[0]            # 第 1 次：上次成功点
+    assert near(seen[1][0], "114.39525"), seen[1]         # 第 2 次：教室 往往
+    assert near(seen[2][0], "114.39500"), seen[2]         # 第 3 次：教室 教学楼B
+    assert info["loc_i"] == 3, info
+    print("13 圆心候选逐个换 OK（成功点 → 教室A → 教室B）")
+finally:
+    d.CI.board = _ob
+    STATE.pop("rooms", None)
 
 print("LOC FLOW OK")

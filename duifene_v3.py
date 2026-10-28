@@ -43,9 +43,12 @@ POLL_JITTER_MS = 600      # 轮询抖动，避免固定节拍
 MAX_AGE_MIN = 30          # 超过 N 分钟的签到视为旧活动
 MAX_TRIES = 5             # 同一活动最多尝试次数
 MAX_TRIES_QR = 12         # 二维码单独放宽：图要等生成/刷新，窗口又只有 9~30 秒
+MAX_TRIES_LOC = 9         # 定位单独放宽：圆心不确定，要留出换候选点的次数
+LOC_MAX_CANDS = 5         # 定位最多换几个候选圆心（多了既超时又容易撞限流）
 RETRY_GAP_S = 2           # 失败后间隔多久再试（签到窗口通常只有 10~30 秒，间隔必须短）
 COOLDOWN_S = 300          # 命中限流后的静默时长
 ROOM_CACHE_S = 600        # 教室坐标缓存时长（老师改教室前不用反复请求）
+OK_TTL_DAYS = 30          # 「上次成功落点」的有效期，超过就不再用它当首选
 LOC_NEAR_M = 12.0         # 定位签到落点：距教室中心最多这么多米（远小于老师设的容差）
 
 # 服务端明确表示"活动已关闭"的文案——命中后说明再试也没用，直接停手。
@@ -241,6 +244,43 @@ class LocMgr:
             lat = (c.get("lat") or "").strip()
             if lng and lat: return lng, lat
         return "", ""
+
+    @staticmethod
+    def mark_ok(name, lng, lat, room=""):
+        """记下这门课定位签到**真的被服务端接受过**的落点。
+
+        服务端到底拿哪个点当圆心没有文档，但"这个点成功过"是硬证据，
+        下次同门课直接从这个点开始试，比重新猜教室靠谱。
+        """
+        name = _s(name)
+        lng, lat = _s(lng), _s(lat)
+        if not (name and lng and lat): return
+        try:
+            locs = LocMgr.load()
+            cur = locs.get(name) or {}
+            cur["ok_lng"], cur["ok_lat"] = lng, lat
+            cur["ok_room"] = _s(room)
+            cur["ok_at"] = datetime.now().strftime(DATE_FMT)
+            locs[name] = cur
+            LocMgr.save(locs)
+        except Exception as ex:
+            log.d("记录成功坐标失败: %s" % ex)
+
+    @staticmethod
+    def ok_point(name):
+        """上次成功落点。超过 OK_TTL_DAYS 天就当过期——换了学期/换了楼，
+        老点只会白撞一次。"""
+        c = LocMgr.load().get(_s(name)) or {}
+        lng, lat = _s(c.get("ok_lng")), _s(c.get("ok_lat"))
+        if not (lng and lat): return "", ""
+        at = _s(c.get("ok_at"))
+        if at:
+            try:
+                if (datetime.now() - datetime.strptime(at, DATE_FMT)).days > OK_TTL_DAYS:
+                    return "", ""
+            except Exception:
+                pass
+        return lng, lat
 
     @staticmethod
     def is_default(lng, lat):
@@ -708,7 +748,8 @@ class CI:
                 except Exception:
                     pass
             info = tried.get(rid) or {}
-            cap = MAX_TRIES_QR if _s(r.get("CheckInType")) == "2" else MAX_TRIES
+            ct = _s(r.get("CheckInType"))
+            cap = MAX_TRIES_QR if ct == "2" else (MAX_TRIES_LOC if ct == "3" else MAX_TRIES)
             if info.get("count", 0) >= cap: continue
             if info.get("next", 0) > ts: continue
             return r
@@ -823,7 +864,10 @@ class CI:
             return False, f"签到请求失败 HTTP {r.status_code}"
         ok, msg = cls._verdict(r)
         if not ok:
-            m = re.search(r"距离[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*米", r.text or "")
+            # 圆心猜错时服务端只回一句「距离教室较远」，不带距离也不带期望坐标，
+            # 所以把原文整段存下来——下次对不上时至少能看清它到底说了什么。
+            dump_resp("loc_fail", r)
+            m = re.search(r"距(?:离)?[:：]?\s*([0-9]+(?:\.[0-9]+)?)\s*米", r.text or "")
             if m:
                 msg = f"{msg}（距目标约 {m.group(1)} 米，建议校准坐标）"
         return ok, msg
@@ -1051,10 +1095,62 @@ class CI:
 
 
 
+def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
+    """定位签到的候选圆心，按可信度排序。返回 [(标签, 经度, 纬度, 教室ID)]。
+
+    服务端拿哪个坐标当圆心是黑盒——教室表里的点、老师发起签到时的手机定位、
+    另一间教室，都可能。以前只压一个点，猜错就整场失败（「距离教室较远」）。
+    现在排成一列候选，失败就换下一个，而不是对着同一个点撞满重试次数。
+    """
+    info = info or {}
+    board = board or {}
+    out, seen = [], set()
+
+    def add(tag, lng, lat, room=""):
+        lng, lat = _s(lng), _s(lat)
+        if not (lng and lat): return
+        try:
+            key = (round(float(lng), 6), round(float(lat), 6))
+        except ValueError:
+            return
+        if key in seen: return
+        seen.add(key)
+        out.append((tag, lng, lat, room))
+
+    # 1 活动记录 / 教师页 hidden 域里带的中心：服务端自己记的点，最权威
+    add("活动坐标", info.get("Longitude"), info.get("Latitude"))
+    kl, ka = parse_lnglat(_s(board.get("key")))
+    add("签到页坐标", kl, ka)
+
+    # 2 人工校准：用户明确填过的点
+    lng, lat = LocMgr.get(cname)
+    if lng and lat and not LocMgr.is_default(lng, lat):
+        add("人工校准", lng, lat)
+
+    # 3 本课程上次定位签到成功过的点——被服务端认过的坐标，证据最硬
+    ol, oa = LocMgr.ok_point(cname)
+    add("上次成功点", ol, oa)
+
+    # 4 教室坐标：HFRoomID 指的那间排前面，其余按课程里的顺序接着试
+    rooms, why = (CI.rooms(cid) if cid else ([], "没有课程"))
+    hint = _s(board.get("roomid"))
+    for r in sorted(rooms, key=lambda x: 0 if _s(x.get("roomid")) == hint else 1):
+        add("教室 %s" % (r.get("name") or r.get("roomid") or "?"),
+            r["lng"], r["lat"], _s(r.get("roomid")))
+    if not rooms and why:
+        log.d("取教室坐标失败: %s" % why)
+
+    # 5 兜底
+    add("兜底坐标", DEFAULT_LNG, DEFAULT_LAT)
+    return out[:limit]
+
+
 class Loop:
     def __init__(s):
         s.r = False; s.ci = ""; s.cn = ""; s._rt = None; s._cid = ""
         s._delay = 0; s._pending = None; s._tick = 0
+        s._bc = None             # 教师页缓存 (cid, ts, dict)
+        s._last_loc = None       # 本次定位实际提交的 (lng, lat, room)，成功后要回写
         s._tried = {}; s._poll_ms = POLL_BASE_MS; s._err = 0
         s._loc_logged = set()   # 教室坐标只打印一次，别每轮重试都刷屏
 
@@ -1122,12 +1218,17 @@ class Loop:
 
     def _exec(s, ct, p, rid):
         info = s._tried.setdefault(rid, {"count": 0, "next": 0})
-        limit = MAX_TRIES_QR if _s(ct) == "2" else MAX_TRIES
+        ct = _s(ct)
+        limit = MAX_TRIES_QR if ct == "2" else (MAX_TRIES_LOC if ct == "3" else MAX_TRIES)
         info["count"] += 1
         ok, msg = s._do(ct, p)
 
         if ok:
             CI.mark_done(rid)
+            if ct == "3" and s._last_loc:
+                # 这个点服务端认了，存下来给同门课下次直接复用
+                LocMgr.mark_ok(s.cn, *s._last_loc)
+                s._last_loc = None
             log.ok(msg)
         elif any(w in (msg or "") for w in CLOSED_WORDS):
             # 服务端已判定活动关闭：补签窗口（ApplyLimitDate）是教师端的，
@@ -1144,6 +1245,20 @@ class Loop:
             else:
                 log.e(f"{msg}（已达上限 {limit} 次，本活动不再尝试）")
 
+    def _board_cached(s, rid="", ttl=8):
+        """教师页按「课程+活动」缓存 8 秒，换圆心时不用每轮都重新拉。"""
+        now = time.time()
+        key = (s._cid, _s(rid))
+        if s._bc and s._bc[0] == key and now - s._bc[1] < ttl:
+            return s._bc[2]
+        b = (CI.board(s._cid) if s._cid else None) or {}
+        s._bc = (key, now, b)
+        return b
+
+    def _loc_cands(s, info):
+        """本次活动的候选圆心（顺序见 loc_candidates）"""
+        return loc_candidates(s._cid, s.cn, info, s._board_cached(info.get("ID")))
+
     def _do(s, ct, info):
         uid = CI.uid()
         if not uid: return False, "无法获取用户ID"
@@ -1158,54 +1273,23 @@ class Loop:
             if not code: return False, "服务端与教师页都没给出签到码"
             return CI.code(uid, code)
         if ct == "3":
-            # 坐标优先级：老师页/活动自带 → 人工校准 → 本次绑定的教室 → 兜底
-            lng = _s(info.get("Longitude")); lat = _s(info.get("Latitude"))
-            board_cache = []          # 教师页只取一次，key 里可能带本次签到的中心
-
-            def board_once():
-                if not board_cache:
-                    board_cache.append((CI.board(s._cid) if s._cid else None) or {})
-                return board_cache[0]
-
-            if not (lng and lat):
-                kl, ka = parse_lnglat(_s(board_once().get("key")))
-                if kl and ka:
-                    lng, lat = kl, ka
-                    log.i(f"用签到页给出的中心: {lng},{lat}")
-            if lng and lat:
-                log.d(f"用活动自带坐标: {lng},{lat}")
+            # 圆心是黑盒，候选列表逐个试；失败下次自动换下一个
+            cands = s._loc_cands(info)
+            if not cands:
+                return False, "没有任何可用坐标（活动、教室、人工校准都没有）"
+            i = int(info.get("loc_i") or 0)
+            if i >= len(cands): i = len(cands) - 1
+            tag, lng, lat, room = cands[i]
+            info["loc_i"] = i + 1
+            rid = _s(info.get("ID"))
+            if i == 0:
+                if rid not in s._loc_logged:
+                    s._loc_logged.add(rid)
+                    log.i(f"圆心: {tag} {lng},{lat}（候选 {len(cands)} 个，失败自动换）")
             else:
-                lng, lat = LocMgr.get(s.cn)
-                if lng and lat and LocMgr.is_default(lng, lat):
-                    lng = lat = ""          # 只是 sync 预填的默认值，不算校准
-                elif lng and lat:
-                    log.d(f"用已保存的坐标: {lng},{lat}")
-            if not lng or not lat:
-                rooms, why = CI.rooms(s._cid)
-                if rooms:
-                    # 一门课可能挂多间教室（换楼上课）。只有一间时不必多问一次教师页；
-                    # 多间时才去读 HFRoomID，确认这次签到绑的是哪一间。
-                    hint = _s(board_once().get("roomid")) if len(rooms) > 1 else ""
-                    r0, _ = CI.pick_room(s._cid, hint)
-                    r0 = r0 or rooms[0]
-                    lng, lat = r0["lng"], r0["lat"]
-                    # 这里的 range 是老师设的容差上限，只当参考值打印，不作为提交依据
-                    fence = _s(r0.get("range"))
-                    if _s(info.get("ID")) not in s._loc_logged:
-                        s._loc_logged.add(_s(info.get("ID")))
-                        parts = []
-                        if len(rooms) > 1:
-                            idx = [r["roomid"] for r in rooms].index(r0["roomid"]) + 1
-                            parts.append(f"共 {len(rooms)} 间，本次绑定的第 {idx} 间")
-                        if fence:
-                            parts.append(f"老师设定容差 {fence} 米，本次只落在 12 米内")
-                        tail = f"（{'；'.join(parts)}）" if parts else ""
-                        log.i(f"教室位置: {r0.get('name') or '未命名'} {lng},{lat}{tail}")
-                else:
-                    log.w(f"取教室坐标失败（{why}），改用兜底坐标")
-            if not lng or not lat: lng, lat = DEFAULT_LNG, DEFAULT_LAT
-            return CI.loc(uid, lng, lat, s._cid, s.ci,
-                          _s(info.get("ID")) or s.cn)
+                log.w(f"换圆心 {i + 1}/{len(cands)}: {tag} {lng},{lat}")
+            s._last_loc = (lng, lat, room)
+            return CI.loc(uid, lng, lat, s._cid, s.ci, rid or s.cn)
         if ct == "4":
             ans = _s(info.get("CheckInCode"))
             if len(ans) != 4:
@@ -1451,7 +1535,7 @@ class App:
         win.transient(s.rt); win.grab_set()
         tk.Label(win, text="课程定位坐标管理", font=("Microsoft YaHei UI", 14, "bold"),
                  bg=CB, fg=CTX).pack(pady=(16, 8))
-        tk.Label(win, text="填了就用你填的（优先于服务端教室坐标）；留空则自动用本次签到绑定的教室",
+        tk.Label(win, text="填了就用你填的（优先于教室坐标）；留空则按「上次成功点 → 教室」自动试，签不上会自动换圆心",
                  font=("Microsoft YaHei UI", 9), bg=CB, fg=CT2).pack()
         tk.Label(win, text="经度那一栏可以直接粘贴「114.40061,22.70745」或高德/腾讯地图链接，会自动拆分",
                  font=("Microsoft YaHei UI", 9), bg=CB, fg=CT2).pack(pady=(2, 0))
@@ -1665,19 +1749,20 @@ class App:
                     log.i(f"  {i}. id={r0['roomid']} {r0.get('name') or '未命名'} "
                           f"{r0['lng']},{r0['lat']}"
                           + (f" 容差 {r0['range']} 米" if r0.get("range") else "") + mark)
-                used, _ = CI.pick_room(cid, _s(b3.get("roomid")) if b3 else "")
-                if used:
-                    p = loc_near(used["lng"], used["lat"], "diag-sample")
-                    log.i(f"将用第 {rooms.index(used) + 1} 间作圆心，落点距它约 "
-                          f"{loc_dist_m(used['lng'], used['lat'], *p):.0f} 米"
-                          f"（实际会按活动 ID 固定，此处为示例）")
             else:
                 log.w(f"教室坐标: {rwhy}")
-            cl, ca = LocMgr.get(s._cv.get() if hasattr(s, "_cv") else "")
+            cname = s._cv.get() if hasattr(s, "_cv") else ""
+            cands = loc_candidates(cid, cname, {}, b3)
+            log.i(f"圆心候选 {len(cands)} 个（签不上会依次换，不用你管）:")
+            for i, (tag, cl, ca, _rm) in enumerate(cands, 1):
+                p = loc_near(cl, ca, "diag-sample")
+                log.i(f"  {i}. {tag} {cl},{ca}（实际落点距它约 "
+                      f"{loc_dist_m(cl, ca, *p):.0f} 米）")
+            cl, ca = LocMgr.get(cname)
             if cl and ca:
                 src = "默认值" if LocMgr.is_default(cl, ca) else "人工校准"
-                log.i(f"本地坐标: {cl},{ca}（{src}，会被教室坐标覆盖）"
-                      if src == "默认值" else f"本地坐标: {cl},{ca}（{src}，优先使用）")
+                log.i(f"本地坐标: {cl},{ca}（{src}，排在教室之前）"
+                      if src == "人工校准" else f"本地坐标: {cl},{ca}（{src}，不参与）")
         log.i("──────── 诊断结束 ────────")
 
     def _toggle_login(s):
