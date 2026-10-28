@@ -1842,7 +1842,35 @@ class App:
         s._st("已停止", CT2)
 
 
+def _res_path(*parts):
+    """随包资源的真实路径：打包后取 _MEIPASS，源码运行时取脚本同级目录。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
+
+
+def set_app_icon(win):
+    """窗口/任务栏/Alt+Tab 图标。PNG 走 iconphoto（多尺寸缩放更干净），ICO 兜底。"""
+    p_png = _res_path("assets", "icon_256.png")
+    p_ico = _res_path("assets", "icon.ico")
+    try:
+        if os.path.exists(p_png):
+            img = tk.PhotoImage(file=p_png)
+            win.iconphoto(True, img)   # True: 之后弹出的 Toplevel 一并继承
+            win._icon_img = img        # 必须持引用，否则被 GC 回收后任务栏变空白
+            return True
+    except Exception as e:
+        log.w("PNG 窗口图标加载失败: %s" % e)
+    try:
+        if os.path.exists(p_ico):
+            win.iconbitmap(default=p_ico)
+            return True
+    except Exception as e:
+        log.w("ICO 窗口图标加载失败: %s" % e)
+    return False
+
+
 if __name__ == "__main__":
     root = tk.Tk()
+    set_app_icon(root)
     App(root)
     root.mainloop()

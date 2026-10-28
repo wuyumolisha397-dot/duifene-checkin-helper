@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('assets/icon_256.png', 'assets'), ('assets/icon.ico', 'assets')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('zxingcpp')
@@ -30,6 +30,7 @@ exe = EXE(
     a.datas,
     [],
     name='duifene_v3',
+    icon='assets/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

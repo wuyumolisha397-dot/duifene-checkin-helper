@@ -26,5 +26,9 @@ _dev/*
 !_dev/test_board.py
 !_dev/test_qr.py
 !_dev/test_loc.py
+!_dev/extract_icon.py
 
 *.log
+
+# 图标原图（微信导出，重生成用 icon_512.png 即可）
+assets/icon_src.jpg

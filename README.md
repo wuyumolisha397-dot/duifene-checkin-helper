@@ -51,6 +51,8 @@ python -m venv .venv
 
 二维码识别依赖 `zxing-cpp` 的 C 扩展，打包时需要在 spec 里带上（本仓库的 spec 已配置）。
 
+图标分两处，都已进包：exe 文件图标由 spec 的 `icon='assets/icon.ico'` 写进 PE 资源（8 个尺寸 16~256），窗口/任务栏图标由程序启动时读 `assets/icon_256.png`，用 `iconphoto` 挂上（`Toplevel` 一并继承）。换图标只要替换 `assets/icon_256.png` 与 `assets/icon.ico` 后重新打包，不用改代码。
+
 ## 实现要点
 
 签到窗口通常只有 9~30 秒，所以整个链路是按「一次签到窗口内能跑完」设计的。
@@ -83,8 +85,9 @@ python -m venv .venv
 ## 目录
 
 ```
-duifene_v3.py      主程序（约 1750 行，GUI + 协议实现）
+duifene_v3.py      主程序（约 1880 行，GUI + 协议实现）
 duifene_v3.spec    PyInstaller 打包配置
+assets/            图标：icon.ico（exe 多尺寸）+ icon_256.png（窗口/任务栏）
 requirements.txt   运行依赖
 _dev/test_*.py     回归测试（纯 mock，不联网）
 ```
