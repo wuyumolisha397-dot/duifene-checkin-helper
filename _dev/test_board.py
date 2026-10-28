@@ -101,4 +101,24 @@ ok, msg = d.Loop._do(loop, "2", {})
 assert not ok and ("识别失败" in msg or "图片" in msg), msg
 print("坏图 -> 可重试 OK:", msg[:40])
 
+# ── 7) 不是 4 位的码也要认：以前写死 len==4，学校用 6 位码就整场签不上 ──
+STATE["board"] = board_html("1", "135790")
+ok, msg = d.Loop._do(loop, "1", {})
+assert ok and "checkincode=135790" in STATE["posts"][-1][1], STATE["posts"][-1]
+print("6 位数字码也算数 OK ->", STATE["posts"][-1][1])
+
+# ── 8) 大屏取不到时，手动填的码优先且能签上 ──
+STATE["board"] = board_html("0", "")
+d.MANUAL["code"] = "6666"
+ok, msg = d.Loop._do(loop, "1", {})
+assert ok and "checkincode=6666" in STATE["posts"][-1][1], (ok, msg, STATE["posts"][-1:])
+print("手动签到码优先 OK ->", STATE["posts"][-1][1])
+
+# ── 9) 大屏没活动 + 没手动码 → 失败信息要说清原因并指向手动入口 ──
+d.MANUAL["code"] = ""
+ok, msg = d.Loop._do(loop, "1", {})
+assert not ok and "没有进行中的签到" in msg and "手动码" in msg, msg
+print("无码失败信息 OK:", msg[:56])
+d.MANUAL["code"] = ""
+
 print("BOARD FLOW OK")

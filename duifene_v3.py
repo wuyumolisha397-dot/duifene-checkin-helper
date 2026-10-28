@@ -944,21 +944,26 @@ class CI:
                   + "），只能用第一间")
         return rooms[0], None
 
+    last_board = {}          # 最近一次大屏页的原始读数，失败时用来解释原因
+
     @classmethod
-    def board(cls, course_id):
+    def board(cls, course_id, want=""):
         """读教师端「进行中签到」页上的大屏信息——学生号同样能读到。
 
-        对应 /_CheckIn/PC/TeachCheckIn.aspx 的三个隐藏域（页面 JS 里就是拿它们
+        对应 /_CheckIn/PC/TeachCheckIn.aspx 的隐藏域（页面 JS 里就是拿它们
         渲染大屏的：`checkCodeKey = $(\"#HFCheckCodeKey\").val()`）：
 
           HFChecktype       1 数字码 / 2 二维码 / 3 定位 / 4 汉字
-          HFCheckCodeKey    type=1 → 4 位数字
+          HFCheckCodeKey    type=1 → 老师设的数字码
                             type=2 → **二维码图片本身的 base64 JPG**
                             type=4 → **按正确顺序排列的 4 个汉字**
           HFCheckCodePinyin type=4 → 逐字拼音，逗号分隔
+          HFCheckInID       大屏此刻在显示哪个活动
 
         没有进行中的活动时 type 为 "0"、key 为空。返回 None 表示取不到。
+        `want` 是本次待签的活动 ID：大屏可能正显示另一场活动，对不上时只记日志。
         """
+        cls.last_board = {}
         if not course_id: return None
         h = {**FORM_H, "Referer": f"{HOST}/_CheckIn/PC/TeachCheckInList.aspx"}
         data = f"courseid={course_id}&moduleid=7&classtype=1"
@@ -967,26 +972,59 @@ class CI:
             try:
                 r = session.post(HOST + "/_CheckIn/PC/TeachCheckIn.aspx",
                                  data=data, headers=hdr, timeout=12)
-                if r.status_code != 200: return None
+                if r.status_code != 200:
+                    cls.last_board = {"why": f"HTTP {r.status_code}"}
+                    return None
                 soup = BeautifulSoup(r.text or "", "html.parser")
-
-                def val(i):
-                    e = soup.find(id=i)
-                    return _s(e.get("value")) if e is not None else ""
-
-                t = val("HFChecktype")
-                if not t or t == "0": return None
-                return {"type": t, "key": val("HFCheckCodeKey"),
-                        "pinyin": val("HFCheckCodePinyin"), "ciid": val("HFCheckInID"),
-                        "roomid": val("HFRoomID"),
-                        "refresh": val("HFIsRefresh"), "interval": val("HFTimeInterval")}
-            except Exception:
+                f = {}
+                for e in soup.find_all("input"):
+                    i = _s(e.get("id"))
+                    if i.startswith("HF"):
+                        f[i] = _s(e.get("value"))
+                t = f.get("HFChecktype", "")
+                info = {"type": t, "key": f.get("HFCheckCodeKey", ""),
+                        "pinyin": f.get("HFCheckCodePinyin", ""),
+                        "ciid": f.get("HFCheckInID", ""), "roomid": f.get("HFRoomID", ""),
+                        "refresh": f.get("HFIsRefresh", ""),
+                        "interval": f.get("HFTimeInterval", ""), "fields": f}
+                cls.last_board = info
+                if not t or t == "0":
+                    # 页面没绑上活动：多半是老师没开大屏、活动已结束，或这门课
+                    # 的签到挂在别的 moduleid 下。留一份原文，下次能直接看。
+                    cls._dump_board(r, course_id, "type0")
+                    return None
+                if want and _s(info["ciid"]) and _s(info["ciid"]) != _s(want):
+                    log.d(f"大屏在显示活动 {info['ciid']}，本次待签 {want}，仍按大屏的码试")
+                return info
+            except Exception as ex:
+                cls.last_board = {"why": f"{type(ex).__name__}: {ex}"}
                 return None
 
         b = fetch(h)
         if b: return b
         # 兜底：换微信 UA 再问一次（教师页按 UA 可能有不同渲染）
         return fetch({**h, "User-Agent": MOBILE_UA})
+
+    _bd_dump = {}
+
+    @classmethod
+    def _dump_board(cls, r, cid, tag):
+        """同一门课同一原因 2 分钟内只存一份，免得刷爆 dump 目录。"""
+        k = f"{cid}|{tag}"
+        now = time.time()
+        if now - cls._bd_dump.get(k, 0) < 120: return
+        cls._bd_dump[k] = now
+        dump_resp(f"board_{tag}_{cid}", r)
+
+    @classmethod
+    def board_why(cls):
+        """把 last_board 翻成一句人话，放进失败信息里。"""
+        b = cls.last_board or {}
+        if b.get("why"): return f"大屏页取不到（{b['why']}）"
+        if not b: return "大屏页无回应"
+        t = _s(b.get("type")) or "0"
+        if t == "0": return "大屏页显示没有进行中的签到（老师可能没开大屏）"
+        return f"大屏 type={t}、码={_s(b.get('key')) or '空'}"
 
     @classmethod
     def hanzi_answer(cls, course_id):
@@ -1161,6 +1199,13 @@ class Peer:
             cls._pts = []
 
 
+MANUAL = {"code": ""}     # 界面「手动签到码」：老师口头报的码，取不到时先试它
+
+
+def manual_code():
+    return _s(MANUAL.get("code")).strip()
+
+
 class Hub:
     """messageHub 的最小实现：连上、注册、收推送，断线自动重连。"""
 
@@ -1169,6 +1214,7 @@ class Hub:
         s._stop = threading.Event()
         s._t = None
         s._ok = False
+        s._seen_code = set()     # 推送里出现过的「码」字段，只提醒一次
 
     def running(s):
         return s._ok
@@ -1289,6 +1335,15 @@ class Hub:
             return
         uid = _s(d.get("UserID"))
         lng, lat = d.get("Longitude"), d.get("Latitude")
+        # 顺带看看推送里有没有带签到码。有的话等于服务端把码广播出来了，
+        # 以后「大屏取不到码」就多一条路；没有也只是少打一行日志。
+        for k, v in d.items():
+            if isinstance(v, str) and re.search(r"code", k, re.I) and 2 <= len(v) <= 12:
+                key = f"{k}={v}"
+                if key not in s._seen_code:
+                    if len(s._seen_code) > 30: s._seen_code.clear()
+                    s._seen_code.add(key)
+                    log.i(f"推送里带 {k}={v}（活动 {_s(d.get('CheckInID')) or '?'}）")
         if not (lng and lat):
             return
         if uid and uid == _s(CI.uid()):
@@ -1490,14 +1545,31 @@ class Loop:
         if not uid: return False, "无法获取用户ID"
         ct = _s(ct)
         if ct == "1":
-            code = _s(info.get("CheckInCode"))
+            # 码有三个来源：活动记录（有就最准）→ 手动填的 → 教师端大屏。
+            # 以前只认「大屏里恰好 4 位的码」，学校用 5/6 位码或码带空格时会被
+            # 直接丢掉，最后报「都没给出签到码」，其实码就在页面里。
+            code, src = _s(info.get("CheckInCode")), "活动记录"
             if not code:
-                b = CI.board(s._cid)
-                if b and b.get("type") == "1":
+                code, src = manual_code(), "手动填写"
+            if not code:
+                b = CI.board(s._cid, _s(info.get("ID")))
+                if b:
                     k = _s(b.get("key"))
-                    if len(k) == 4: code = k; log.d(f"大屏数字码: {code}")
-            if not code: return False, "服务端与教师页都没给出签到码"
-            return CI.code(uid, code)
+                    if _s(b.get("type")) == "1" and k and len(k) <= 12:
+                        code, src = k, "大屏"
+                    elif _s(b.get("type")) != "1":
+                        log.w(f"大屏显示的是类型 {b.get('type')}（本次是数字码），"
+                              f"老师可能刚换了签到方式")
+            if not code:
+                return False, f"拿不到数字码：{CI.board_why()}；可在左侧填『手动码』"
+            if not code.isdigit():
+                log.d(f"签到码不是纯数字: {code!r}（仍按原样提交）")
+            log.d(f"数字码 {code}（来源: {src}）")
+            ok, msg = CI.code(uid, code)
+            if not ok and src == "手动填写":
+                MANUAL["code"] = ""      # 手动码错了就清掉，别拿它一直重试
+                log.w("手动码没签上，已清空；确认老师这次报的码后重新填")
+            return ok, msg
         if ct == "3":
             # 圆心是黑盒，候选列表逐个试。以前把「换到第几个」记在页面 dict 上，
             # 而每次轮询都会重建那份 dict——于是换点永远从 0 开始，9 次重试全砸在
@@ -1524,14 +1596,17 @@ class Loop:
         if ct == "4":
             ans = _s(info.get("CheckInCode"))
             if len(ans) != 4:
-                b = CI.board(s._cid)
+                ans = manual_code()          # 手动填的汉字顺序
+            if len(ans) != 4:
+                b = CI.board(s._cid, _s(info.get("ID")))
                 if b and b.get("type") == "4":
                     k = _s(b.get("key"))
                     if len(k) == 4:
                         ans = k
                         py = _s(b.get("pinyin")).replace(",", " ")
                         log.d(f"大屏汉字顺序: {ans}" + (f"（{py}）" if py else ""))
-            if len(ans) != 4: return False, "教师页没给出汉字顺序"
+            if len(ans) != 4:
+                return False, f"拿不到汉字顺序：{CI.board_why()}；可在左侧填『手动码』"
             return CI.code(uid, ans)
         if ct == "2":
             done, msg = CI.qr_fast(s._cid)
@@ -1684,7 +1759,7 @@ class App:
         s._ch = tk.Label(cc, text="下拉选中课程后，点左下『开始监听』",
                          font=("Microsoft YaHei UI", 9), bg=CC, fg=CT2,
                          wraplength=320, justify=tk.LEFT)
-        s._ch.pack(anchor=tk.W, pady=(0, 8))
+        s._ch.pack(anchor=tk.W, pady=(0, 4))
 
         mf = tk.Frame(cc, bg=CC); mf.pack(fill=tk.X, pady=(0, 8))
         tk.Label(mf, text="取不到课程列表时，填 TClassID 也能直接监听"
@@ -1703,6 +1778,19 @@ class App:
         tk.Button(mf, text="添加并使用", command=s._add_manual,
                   font=("Microsoft YaHei UI", 10, "bold"), bg="#6c5ce7", fg="white",
                   relief=tk.FLAT, cursor="hand2", pady=4).pack(fill=tk.X, pady=(6, 0))
+
+        # 数字码/汉字顺序取不到时的人工兜底：老师口头报码，填这里就直接用
+        mcf = tk.Frame(cc, bg=CC); mcf.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(mcf, text="手动码", font=("Microsoft YaHei UI", 10), bg=CC,
+                 fg=CT2).pack(side=tk.LEFT)
+        s._me = tk.Entry(mcf, font=("Microsoft YaHei UI", 11), relief=tk.FLAT,
+                         bg="#f1f2f6", width=8, insertbackground=CPRI)
+        s._me.pack(side=tk.LEFT, padx=(6, 0), ipady=2)
+        s._me.bind("<KeyRelease>", lambda e: s._set_manual())
+        s._me.bind("<Return>", lambda e: s._sign_manual())
+        tk.Button(mcf, text="用此码签到", command=s._sign_manual,
+                  font=("Microsoft YaHei UI", 10, "bold"), bg="#0984e3", fg="white",
+                  relief=tk.FLAT, cursor="hand2", padx=8, pady=2).pack(side=tk.LEFT, padx=(6, 0))
 
         s._cc = cc
 
@@ -1942,7 +2030,9 @@ class App:
                       f"HFTimeInterval={_s(b.get('interval')) or '0'} 秒"
                       f"（0 表示大屏不轮换，此时大屏那张图长期有效）")
         else:
-            log.i("教师页大屏: 当前没有进行中的签到（type=0 或取不到）")
+            log.i(f"教师页大屏: 取不到（{CI.board_why()}）")
+            if CI.last_board.get("fields"):
+                log.d(f"大屏页隐藏域: {CI.last_board['fields']}")
         # 二维码专项：先看大屏那张图（不触发轮换），再实签一次
         if b and b.get("type") == "2":
             key = _s(b.get("key"))
@@ -2072,7 +2162,35 @@ class App:
         s._st(f"已选中: {name}", CSUC)
         log.ok(f"已添加手动课程：{name}（TClassID={tcid}，CourseID={cid or '未填'}）")
         if not cid:
-            log.w("未填 CourseID：汉字签到答案取不到，数字码/二维码/定位不受影响")
+            log.w("未填 CourseID：读数大屏（数字码/汉字/二维码）都要它，"
+                  "只填 TClassID 时只能签到、拿不到码")
+
+    def _set_manual(s):
+        MANUAL["code"] = s._me.get().strip()
+
+    def _sign_manual(s):
+        """手动码直接签一次：老师口头报了码、自动取不到时用这个补。"""
+        code = s._me.get().strip()
+        if not code:
+            log.w("先填签到码，再点『用此码签到』"); return
+        if not s._cid:
+            log.w("先在『课程选择』里选中课程"); return
+        uid = CI.uid()
+        if not uid:
+            log.w("请先登录"); return
+        MANUAL["code"] = code
+        log.i(f"用手动码 {code} 签到（课程 {s.cn}）")
+
+        def work():
+            try:
+                ok, msg = CI.code(uid, code)
+                (log.ok if ok else log.w)(msg)
+                if ok:
+                    log.i("以后遇到数字码签到会先用手动码，记得老师换码时同步更新")
+            except Exception as ex:
+                log.e(f"手动签到异常: {ex}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _rf(s):
         cs, err = Course.list()
@@ -2146,6 +2264,18 @@ class App:
         if not ci:
             messagebox.showerror("错误", "该课程没有 TClassID，无法监听：请手动填写后添加")
             return
+        if not cid:
+            # 手动添加的课常常只填 TClassID。读数大屏（数字码/汉字/二维码）全靠
+            # CourseID，缺了就一律「取不到码」，所以先拿 TClassID 反查一次。
+            cid = next((_s(c.get("CourseID")) for c in (s._cs or [])
+                        if _s(c.get("TClassID")) == ci and _s(c.get("CourseID"))), "")
+            if cid:
+                target["CourseID"] = cid
+                Manual.save([c for c in s._cs if c.get("_manual")])
+                log.ok(f"按 TClassID={ci} 补到 CourseID={cid}")
+            else:
+                log.w("这门课没有 CourseID：数字码/汉字/二维码都读不到大屏，"
+                      "取不到码时用左侧『手动码』补")
         if not Auth.ok():
             messagebox.showerror("错误", "登录已失效，请重新登录")
             return
