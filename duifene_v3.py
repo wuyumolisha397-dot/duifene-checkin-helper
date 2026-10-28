@@ -42,6 +42,7 @@ DATE_FMT = "%Y/%m/%d %H:%M:%S"
 POLL_BASE_MS = 2000       # 基础轮询间隔
 POLL_JITTER_MS = 600      # 轮询抖动，避免固定节拍
 MAX_AGE_MIN = 30          # 超过 N 分钟的签到视为旧活动
+BOARD_SYNC_GRACE_S = 120  # 大屏 type=0 时，发起不满这么久的活动仍按「可能还没同步」继续重试
 MAX_TRIES = 5             # 同一活动最多尝试次数
 MAX_TRIES_QR = 12         # 二维码单独放宽：图要等生成/刷新，窗口又只有 9~30 秒
 MAX_TRIES_LOC = 9         # 定位单独放宽：圆心不确定，要留出换候选点的次数
@@ -511,6 +512,35 @@ def row_signed(r):
     if _s(r.get("StatusName")) == "出勤":
         return True
     return False
+
+
+def row_age_s(r):
+    """这条活动从发起到现在过了多少秒；解析不了返回 None。"""
+    try:
+        t = datetime.strptime(_s(r.get("CreaterDate")), DATE_FMT)
+        return max(0.0, (datetime.now() - t).total_seconds())
+    except Exception:
+        return None
+
+
+def board_dead(info, grace_s=BOARD_SYNC_GRACE_S):
+    """大屏明确说「没有进行中的签到」，且这场活动不是刚发起 → 判它已经结束。
+
+    行数据里的 `CanApply=1` / `ApplyLimitDate` 是**补签申请**的窗口，不是签到窗口。
+    老师把签到结束后，行还挂着 CanApply=1，于是老版本拿 2 秒一次去撞，撞满 5 次
+    才报「服务端与教师页都没给出签到码」——码当然取不到，那场早就不在了。
+    真正能证明「这场还活着」的只有大屏页：HFChecktype != 0，且 HFSeconds 还没归零。
+
+    刚发起的头 2 分钟大屏可能还没同步（实测同秒发起、同秒就能读到，但别赌），
+    所以留一个宽限期，宽限期内照旧重试。
+    """
+    lb = CI.last_board or {}
+    if _s(lb.get("type")) != "0":      # 大屏没解析成 type=0，不作判断
+        return ""
+    age = row_age_s(info)
+    if age is None or age <= grace_s:
+        return ""
+    return "活动已发起 %d 分钟，大屏 type=0" % (age // 60)
 
 
 def decode_qr_image(src):
@@ -1055,6 +1085,10 @@ class CI:
 
         b = fetch(h)
         if b: return b
+        # 页面正常解析、只是没有进行中的活动：这是服务端的明确回答，换 UA 再问一遍
+        # 也是同一个答案，白多一次请求。取码失败时这类请求会堆起来，堆够了就是限流。
+        if _s((cls.last_board or {}).get("type")) == "0":
+            return None
         # 兜底：换微信 UA 再问一次（教师页按 UA 可能有不同渲染）
         return fetch({**h, "User-Agent": MOBILE_UA})
 
@@ -1076,7 +1110,7 @@ class CI:
         if b.get("why"): return f"大屏页取不到（{b['why']}）"
         if not b: return "大屏页无回应"
         t = _s(b.get("type")) or "0"
-        if t == "0": return "大屏页显示没有进行中的签到（老师可能没开大屏）"
+        if t == "0": return "大屏页显示没有进行中的签到（这场多半已经结束；老师没开大屏也会这样）"
         return f"大屏 type={t}、码={_s(b.get('key')) or '空'}"
 
     @classmethod
@@ -1615,6 +1649,9 @@ class Loop:
                         log.w(f"大屏显示的是类型 {b.get('type')}（本次是数字码），"
                               f"老师可能刚换了签到方式")
             if not code:
+                dead = board_dead(info)
+                if dead:
+                    return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
                 return False, f"拿不到数字码：{CI.board_why()}；可在左侧填『手动码』"
             if not code.isdigit():
                 log.d(f"签到码不是纯数字: {code!r}（仍按原样提交）")
@@ -1660,6 +1697,9 @@ class Loop:
                         py = _s(b.get("pinyin")).replace(",", " ")
                         log.d(f"大屏汉字顺序: {ans}" + (f"（{py}）" if py else ""))
             if len(ans) != 4:
+                dead = board_dead(info)
+                if dead:
+                    return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
                 return False, f"拿不到汉字顺序：{CI.board_why()}；可在左侧填『手动码』"
             return CI.code(uid, ans)
         if ct == "2":
@@ -1679,6 +1719,9 @@ class Loop:
             if done is not None:
                 return done, msg
             # None：教师页上没有进行中的活动，或大屏类型已经不是二维码
+            dead = board_dead(info)
+            if dead:
+                return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
             return False, msg or "教师页上没有进行中的签到"
         return False, f"未知签到类型: {ct}"
 

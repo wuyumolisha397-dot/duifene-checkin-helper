@@ -98,6 +98,10 @@ python -m venv .venv
 
 换楼上课、老师临时改地点，用第 2 条覆盖即可。
 
+**数字码**：`getstudentinlogbyday` 返回的 17 个字段里**没有签到码**（`ID / CheckInType / CreaterDate / Remark / ApplyLimitDate / StudentID / CheckInDate / CheckInStatus / CanApply / StatusID / StatusName / ApplyStatus / ApprovalTime / ApproverID / FillDate / FillStatus / ApplyDel`），码只能在教师端大屏页的 `HFCheckCodeKey` 里，而**大屏只在这一场签到还没结束时才给码**。
+
+这一点很容易踩坑：老师结束后，行数据里的 `CanApply` 仍然是 `1`、`ApplyLimitDate` 也还没到——那是**补签申请**的截止时间，不是签到窗口，于是程序会以为还活着，2 秒一次撞满 5 次，最后报「服务端与教师页都没给出签到码」。现在只要大屏明确回 `HFChecktype=0`、而这条活动已经发起超过 2 分钟（`BOARD_SYNC_GRACE_S`，防止刚发起时大屏还没同步），就直接判定这场已结束、停手不再重试；发起不满 2 分钟的仍照常重试。
+
 **汉字**：`HFCheckCodeKey` 在 type=4 时直接就是正确顺序的 4 个字，不需要自己按拼音去排。提交时 `checkincode` 必须 percent-encode 成 UTF-8（`%E9%A0%94...`）：data 传的是 str，requests 原样交给 `http.client`，而它按 latin-1 发送，中文会直接抛 `UnicodeEncodeError`，签到根本发不出去。
 
 ## 目录
@@ -127,10 +131,12 @@ _dev/test_*.py     回归测试（纯 mock，不联网）
 
 - 老师**重开**签到属于全新活动（新 ID、新二维码），可以正常捕获；但已经结束的活动拿不到二维码，也补不了签——过期提交服务端会直接拒绝。
 - 定位签到依赖教室配置。老师没在平台里设置教室坐标时只能退回校区默认点。
+- 数字码/汉字如果卡在「拿不到码」，先看日志是不是写着「大屏上这场签到已经不在了」——那说明发现它时这场已经结束，补签只能找老师走申请流程。
 - 平台改版会导致接口失效，`HFChecktype` 之类的字段名是最容易变的部分。
 
 ## 更新记录
 
+- **v3.16** 数字码/汉字「取不到码」不再瞎重试：大屏 `HFChecktype=0` 且活动已发起超过 2 分钟就判它已结束（`CanApply`/`ApplyLimitDate` 是补签窗口，不是签到窗口）；大屏 `type=0` 时也不再拿微信 UA 多打一次
 - **v3.15** 二维码：新增「活动 ID 当 state」直签通道（部分部署可用，省掉取图解码与换图竞态）；待签到列表改按 `CreaterDate` 从新到旧挑，不再拿已结束的旧记录反复重试
 - **v3.14** 数字码放宽到不限位数；汉字/空格统一 percent-encode；定位换圆心按真实重试次数推进
 - **v3.7** 定位：优先用签到页自带的中心；多教室按 `HFRoomID` 选楼；「坐标管理」支持粘贴地图坐标/链接
