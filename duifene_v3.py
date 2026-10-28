@@ -849,7 +849,7 @@ class CI:
             lng, lat = loc_near(lng, lat, seed_key)
         except (TypeError, ValueError):
             return False, "坐标格式无效"
-        log.d(f"定位提交: {lng},{lat}（距教室 {loc_dist_m(origin[0], origin[1], lng, lat):.0f} 米）")
+        log.d(f"定位提交: {lng},{lat}（距本次圆心 {loc_dist_m(origin[0], origin[1], lng, lat):.0f} 米）")
         orig_ua = session.headers.get("User-Agent", "")
         try:
             session.headers["User-Agent"] = MOBILE_UA
@@ -1197,7 +1197,7 @@ class Hub:
         except Exception as ex:
             log.w(f"缺少 websocket-client，跟随同学坐标不可用（{ex}）")
             return
-        delay = 1.0
+        fails = 0
         while not s._stop.is_set():
             try:
                 r = session.post(WS_HUB + "/negotiate?negotiateVersion=1",
@@ -1218,16 +1218,20 @@ class Hub:
                     s._send({"type": 1, "invocationId": "1",
                              "target": "connect", "arguments": [key_id]})
                 s._ok = True
-                delay = 1.0
+                fails = 0
                 log.i("消息推送已连接（同学签到成功后会广播坐标，可直接复用）")
                 s._read()
             except Exception as ex:
                 s._ok = False
                 if s._stop.is_set():
                     return
-                log.d(f"消息推送断开: {ex}（{delay:.0f} 秒后重连）")
-                s._stop.wait(delay)
-                delay = min(delay * 2, 30)
+                fails += 1
+                # 实测：新进程第一次握手几乎必回 404（服务端还没把连接登记上），
+                # 隔 1 秒重新 negotiate 就成功。所以前两次固定等 1 秒，别一上来
+                # 就退避到 8 秒——定位签到的窗口只有几十秒，等不起。
+                wait = 1.0 if fails <= 2 else min(2 ** (fails - 2), 30)
+                log.d(f"消息推送断开: {ex}（{wait:.0f} 秒后重连）")
+                s._stop.wait(wait)
             finally:
                 try:
                     if s._ws:
@@ -1325,11 +1329,10 @@ def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
     if lng and lat and not LocMgr.is_default(lng, lat):
         add("人工校准", lng, lat)
 
-    # 3 本课程上次定位签到成功过的点——被服务端认过的坐标，证据最硬
-    ol, oa = LocMgr.ok_point(cname)
-    add("上次成功点", ol, oa)
-
-    # 4 教室坐标：HFRoomID 指的那间排前面，其余按课程里的顺序接着试
+    # 3 教室坐标：HFRoomID 指的那间排前面，其余按课程里的顺序接着试。
+    #   排在「上次成功点」前面有实测依据：21:37 那次用上次成功点当圆心，程序算距它
+    #   8 米，老师端却显示 36 米；而提交点距教室 e3 正好 34.1 米 —— 说明服务端比的
+    #   就是教室表这间。圆心贴着它取点，服务端算出来就是 5~12 米，又稳又不扎眼。
     rooms, why = (CI.rooms(cid) if cid else ([], "没有课程"))
     hint = _s(board.get("roomid"))
     for r in sorted(rooms, key=lambda x: 0 if _s(x.get("roomid")) == hint else 1):
@@ -1342,6 +1345,11 @@ def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
         # 教室表和老师建活动时用的不是一套（换了账号、教室被删、跨校区导入），
         # 那就别信「就近那间」，全部当候选逐间试。
         log.w(f"活动绑定的教室(HFRoomID={hint}) 不在你的教室列表里，逐间试")
+
+    # 4 本课程上次定位签到成功过的点：被服务端认过，但它只保证「在容差内」，
+    #   不代表靠近圆心（可能就是擦着 150 米边过的）。所以放在教室后面当备胎
+    ol, oa = LocMgr.ok_point(cname)
+    add("上次成功点", ol, oa)
 
     # 5 兜底：只有一条候选都排不出来时才用。写死的默认点是「本机这个账号常用的
     #   那个位置」，换个人、换门课就毫无意义，硬塞进列表只会白烧一次重试

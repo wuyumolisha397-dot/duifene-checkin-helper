@@ -195,10 +195,12 @@ try:
         seen.append(loop._last_loc[:2])
     print("13 依次换圆心:", " -> ".join("%s,%s" % p for p in seen))
     assert len(set(seen)) == 3, seen                      # 三次三个不同点
-    assert near(seen[0][0], "114.39"), seen[0]            # 第 1 次：上次成功点
-    assert near(seen[1][0], "114.39525"), seen[1]         # 第 2 次：教室 往往
-    assert near(seen[2][0], "114.39500"), seen[2]         # 第 3 次：教室 教学楼B
-    print("13 圆心候选逐个换 OK（成功点 → 教室A → 教室B）")
+    # 教室排在「上次成功点」前面：实测服务端比的就是教室表那间，
+    # 圆心贴着它取点，老师端算出来的距离才小
+    assert near(seen[0][0], "114.39525"), seen[0]         # 第 1 次：教室 往往
+    assert near(seen[1][0], "114.39500"), seen[1]         # 第 2 次：教室 教学楼B
+    assert near(seen[2][0], "114.39"), seen[2]            # 第 3 次：上次成功点
+    print("13 圆心候选逐个换 OK（教室A → 教室B → 成功点）")
 finally:
     d.CI.board = _ob
     STATE.pop("rooms", None)
