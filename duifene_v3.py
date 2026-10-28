@@ -579,6 +579,32 @@ def loc_near(lng, lat, seed_key="", radius_m=LOC_NEAR_M):
     return round(lng + dlng, 8), round(lat + dlat, 8)
 
 
+def parse_lnglat(text):
+    """从文本里取经纬度，返回 (lng, lat)，取不到返回 ("", "")。
+
+    支持 `114.40061,22.70745`、`114.40061 22.70745`、以及高德/腾讯地图那种
+    一长串链接（里面同样有两段小数）。顺序按取值范围判断，中国境内经度
+    73~136、纬度 3~54，一般不会搞混。地图链接里常带国测局偏移的 gcj02 坐标，
+    与老师端点击地图取值同源，直接用即可。
+    """
+    t = _s(text)
+    if not t:
+        return "", ""
+    nums = re.findall(r"-?\d{1,3}\.\d{3,}", t)
+    if len(nums) < 2:
+        return "", ""
+    a, b = float(nums[0]), float(nums[1])
+    lng_ok = 73.0 <= a <= 136.0
+    lat_ok = 3.0 <= a <= 54.0
+    lng_ok2 = 73.0 <= b <= 136.0
+    lat_ok2 = 3.0 <= b <= 54.0
+    if lng_ok and lat_ok2:
+        return f"{a:.8f}", f"{b:.8f}"
+    if lat_ok and lng_ok2:
+        return f"{b:.8f}", f"{a:.8f}"
+    return "", ""
+
+
 class CI:
     done = set()
     _uid = None
@@ -840,6 +866,27 @@ class CI:
             return [], f"取教室坐标异常: {ex}"
 
     @classmethod
+    def pick_room(cls, course_id, room_id_hint=""):
+        """选本次签到的圆心教室。
+
+        一门课可能挂多间教室（换楼上课就是这个情况）。老师发起定位签到时，
+        教师页的 HFRoomID 会指向**本次**绑定的那间，所以优先按它匹配；
+        匹配不上（或本来就只有一间）才退回列表第一个。
+        """
+        rooms, why = cls.rooms(course_id)
+        if not rooms:
+            return None, why
+        want = _s(room_id_hint)
+        if want and want != "0":
+            for r in rooms:
+                if r["roomid"] == want:
+                    return r, None
+            log.w(f"本次绑定教室 {want} 不在课程教室列表里（现有 "
+                  + ", ".join(f"{r['roomid']}/{r.get('name') or '?'}" for r in rooms[:4])
+                  + "），只能用第一间")
+        return rooms[0], None
+
+    @classmethod
     def board(cls, course_id):
         """读教师端「进行中签到」页上的大屏信息——学生号同样能读到。
 
@@ -873,6 +920,7 @@ class CI:
                 if not t or t == "0": return None
                 return {"type": t, "key": val("HFCheckCodeKey"),
                         "pinyin": val("HFCheckCodePinyin"), "ciid": val("HFCheckInID"),
+                        "roomid": val("HFRoomID"),
                         "refresh": val("HFIsRefresh"), "interval": val("HFTimeInterval")}
             except Exception:
                 return None
@@ -1110,8 +1158,20 @@ class Loop:
             if not code: return False, "服务端与教师页都没给出签到码"
             return CI.code(uid, code)
         if ct == "3":
-            # 坐标优先级：活动自带 → 人工校准过的缓存 → 服务端给的教室坐标 → 兜底
+            # 坐标优先级：老师页/活动自带 → 人工校准 → 本次绑定的教室 → 兜底
             lng = _s(info.get("Longitude")); lat = _s(info.get("Latitude"))
+            board_cache = []          # 教师页只取一次，key 里可能带本次签到的中心
+
+            def board_once():
+                if not board_cache:
+                    board_cache.append((CI.board(s._cid) if s._cid else None) or {})
+                return board_cache[0]
+
+            if not (lng and lat):
+                kl, ka = parse_lnglat(_s(board_once().get("key")))
+                if kl and ka:
+                    lng, lat = kl, ka
+                    log.i(f"用签到页给出的中心: {lng},{lat}")
             if lng and lat:
                 log.d(f"用活动自带坐标: {lng},{lat}")
             else:
@@ -1123,14 +1183,24 @@ class Loop:
             if not lng or not lat:
                 rooms, why = CI.rooms(s._cid)
                 if rooms:
-                    r0 = rooms[0]
+                    # 一门课可能挂多间教室（换楼上课）。只有一间时不必多问一次教师页；
+                    # 多间时才去读 HFRoomID，确认这次签到绑的是哪一间。
+                    hint = _s(board_once().get("roomid")) if len(rooms) > 1 else ""
+                    r0, _ = CI.pick_room(s._cid, hint)
+                    r0 = r0 or rooms[0]
                     lng, lat = r0["lng"], r0["lat"]
                     # 这里的 range 是老师设的容差上限，只当参考值打印，不作为提交依据
                     fence = _s(r0.get("range"))
                     if _s(info.get("ID")) not in s._loc_logged:
                         s._loc_logged.add(_s(info.get("ID")))
-                        log.i(f"教室位置: {r0.get('name') or '未命名'} {lng},{lat}"
-                              + (f"（老师设定容差 {fence} 米，本次只落在 12 米内）" if fence else ""))
+                        parts = []
+                        if len(rooms) > 1:
+                            idx = [r["roomid"] for r in rooms].index(r0["roomid"]) + 1
+                            parts.append(f"共 {len(rooms)} 间，本次绑定的第 {idx} 间")
+                        if fence:
+                            parts.append(f"老师设定容差 {fence} 米，本次只落在 12 米内")
+                        tail = f"（{'；'.join(parts)}）" if parts else ""
+                        log.i(f"教室位置: {r0.get('name') or '未命名'} {lng},{lat}{tail}")
                 else:
                     log.w(f"取教室坐标失败（{why}），改用兜底坐标")
             if not lng or not lat: lng, lat = DEFAULT_LNG, DEFAULT_LAT
@@ -1381,8 +1451,10 @@ class App:
         win.transient(s.rt); win.grab_set()
         tk.Label(win, text="课程定位坐标管理", font=("Microsoft YaHei UI", 14, "bold"),
                  bg=CB, fg=CTX).pack(pady=(16, 8))
-        tk.Label(win, text="修改后点击保存，未配置的课程使用默认坐标",
+        tk.Label(win, text="填了就用你填的（优先于服务端教室坐标）；留空则自动用本次签到绑定的教室",
                  font=("Microsoft YaHei UI", 9), bg=CB, fg=CT2).pack()
+        tk.Label(win, text="经度那一栏可以直接粘贴「114.40061,22.70745」或高德/腾讯地图链接，会自动拆分",
+                 font=("Microsoft YaHei UI", 9), bg=CB, fg=CT2).pack(pady=(2, 0))
 
         canvas = tk.Canvas(win, bg=CB, highlightthickness=0)
         scrollbar = tk.Scrollbar(win, orient=tk.VERTICAL, command=canvas.yview)
@@ -1420,11 +1492,32 @@ class App:
             widgets[name] = (le, ae, ne); row += 1
 
         def save_all():
-            cur = LocMgr.load()
+            cur = LocMgr.load(); bad = []
             for name, (le, ae, ne) in widgets.items():
-                cur[name] = {"lng": le.get().strip() or DEFAULT_LNG,
-                             "lat": ae.get().strip() or DEFAULT_LAT,
-                             "note": ne.get().strip()}
+                a = (le.get() or "").strip()
+                b = (ae.get() or "").strip()
+                if not a and not b:
+                    # 留空 = 不指定，交给服务端教室坐标
+                    cur[name] = {"lng": "", "lat": "", "note": ne.get().strip()}
+                    continue
+                lng, lat = "", ""
+                if a and ("," in a or "，" in a or "http" in a.lower()):
+                    lng, lat = parse_lnglat(a)      # 粘的是一串坐标或地图链接
+                if not lng or not lat:
+                    lng, lat = parse_lnglat(f"{a},{b}") if (a and b) else ("", "")
+                if not lng or not lat:
+                    lng, lat = a, b
+                try:
+                    float(lng); float(lat)
+                except (TypeError, ValueError):
+                    bad.append(name)
+                    continue
+                cur[name] = {"lng": lng, "lat": lat, "note": ne.get().strip()}
+            if bad:
+                messagebox.showwarning(
+                    "格式不对",
+                    "这些课程填的不是经纬度数字，先改一下：\n\n" + "\n".join(bad[:8]), parent=win)
+                return
             LocMgr.save(cur)
             messagebox.showinfo("提示", "坐标已保存", parent=win)
 
@@ -1556,15 +1649,28 @@ class App:
                 log.i(f"最新二维码接口: {len(img)} 字符，内容 {txt!r}")
             else:
                 log.i(f"最新二维码接口: {why}（没有二维码进行中时正常）")
-        # 定位专项：教室坐标 + 本地缓存，定位签到的判定就是「离教室够近」
+        # 定位专项：本次签到的圆心教室 + 全部教室 + 本地缓存
         if cid:
+            b3 = CI.board(cid)
+            if b3:
+                log.i(f"进行中: 【{TYPE_NAME.get(b3.get('type'), b3.get('type'))}】"
+                      f"HFRoomID={b3.get('roomid') or '0'}"
+                      + ("（本次绑定这间教室）" if b3.get("type") == "3" else ""))
             rooms, rwhy = CI.rooms(cid)
             if rooms:
-                for r0 in rooms[:3]:
-                    log.i(f"教室位置: {r0.get('name') or '未命名'} {r0['lng']},{r0['lat']}"
-                          + (f"（老师设定容差 {r0['range']} 米，只是上限）" if r0.get("range") else ""))
-                log.i(f"定位提交: 教室附近 {LOC_NEAR_M * 0.25:.0f}~{LOC_NEAR_M:.0f} 米内取点，"
-                      f"同一次签到固定不变")
+                log.i(f"课程教室 {len(rooms)} 间:")
+                for i, r0 in enumerate(rooms[:6], 1):
+                    mark = ("  ← 本次绑定"
+                            if b3 and _s(b3.get("roomid")) == r0["roomid"] else "")
+                    log.i(f"  {i}. id={r0['roomid']} {r0.get('name') or '未命名'} "
+                          f"{r0['lng']},{r0['lat']}"
+                          + (f" 容差 {r0['range']} 米" if r0.get("range") else "") + mark)
+                used, _ = CI.pick_room(cid, _s(b3.get("roomid")) if b3 else "")
+                if used:
+                    p = loc_near(used["lng"], used["lat"], "diag-sample")
+                    log.i(f"将用第 {rooms.index(used) + 1} 间作圆心，落点距它约 "
+                          f"{loc_dist_m(used['lng'], used['lat'], *p):.0f} 米"
+                          f"（实际会按活动 ID 固定，此处为示例）")
             else:
                 log.w(f"教室坐标: {rwhy}")
             cl, ca = LocMgr.get(s._cv.get() if hasattr(s, "_cv") else "")

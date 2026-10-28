@@ -145,4 +145,32 @@ b = d.loc_near(ROOM["lng"], ROOM["lat"], "B")
 assert a != b, (a, b)
 print(f"10 不同活动位置不同 OK: {a} vs {b}")
 
+# ── 11) 文本里的经纬度解析（粘贴地图坐标/链接） ──
+CASES = [
+    ("114.40061188,22.70745659", 114.40061188, 22.70745659),
+    ("22.70745659,114.40061188", 114.40061188, 22.70745659),   # 顺序颠倒也要认
+    ("114.40061 22.70745", 114.40061, 22.70745),
+    ("https://uri.amap.com/marker?position=114.400611,22.707456&name=x", 114.400611, 22.707456),
+]
+for txt, wlng, wlat in CASES:
+    glng, glat = d.parse_lnglat(txt)
+    assert glng and glat, (txt, glng, glat)
+    assert abs(float(glng) - wlng) < 1e-6 and abs(float(glat) - wlat) < 1e-6, (txt, glng, glat)
+for txt in ("", "abc", "签到码 1234", "114.40"):
+    assert d.parse_lnglat(txt) == ("", ""), (txt, d.parse_lnglat(txt))
+print("11 坐标文本解析 OK（含地图链接、顺序颠倒、无效输入）")
+
+# ── 12) 教师页把本次中心塞在 key 里时，优先于教室坐标 ──
+MEM.clear(); d.CI._rooms.clear(); STATE["room_ok"] = True
+_orig_board = d.CI.board
+try:
+    d.CI.board = lambda cid: {"type": "3", "key": "114.31000000,22.61000000", "roomid": "0"}
+    STATE["posts"].clear()
+    ok, _ = d.Loop._do(loop, "3", {"ID": "9200"})
+    x, y = signin_xy()
+    assert ok and near(x, "114.31") and near(y, "22.61"), (x, y)
+    print(f"12 签到页给的中心优先 OK: {x},{y}")
+finally:
+    d.CI.board = _orig_board
+
 print("LOC FLOW OK")
