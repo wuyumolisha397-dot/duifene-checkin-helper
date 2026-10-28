@@ -2,3 +2,4 @@ requests>=2.31
 beautifulsoup4>=4.12
 pillow>=10.0
 zxing-cpp>=2.2
+websocket-client>=1.7

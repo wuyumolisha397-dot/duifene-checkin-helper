@@ -204,4 +204,21 @@ finally:
     d.CI.board = _ob
     STATE.pop("rooms", None)
 
+# ── 14) 同学坐标：广播抄来的点排最前，太远的广播直接丢 ──
+d.Peer.clear()
+assert d.Peer.add("114.396", "22.702", 8) is True, "合格坐标应入队"
+assert d.Peer.add("114.5", "22.9", 5000) is False, "远点应被丢弃"
+assert d.Peer.add("114.3965", "22.7015", 3) is True
+pts = d.Peer.best()
+assert len(pts) == 2 and abs(pts[0][0] - 114.3965) < 1e-9, pts
+MEM.clear(); STATE["rooms"] = [RAW_ROOM]; d.CI._rooms.clear()
+cands = d.loc_candidates("300001", "测试课程", {}, {})
+assert cands[0][0] == "同学坐标", cands
+assert cands[:2] == [("同学坐标", "114.3965", "22.7015", ""),
+                     ("同学坐标", "114.396", "22.702", "")], cands
+assert cands[2][0] == "教室 1", cands
+print("14 同学坐标排第一、远点被丢弃 OK:", [c[0] for c in cands])
+d.Peer.clear()
+STATE.pop("rooms", None)
+
 print("LOC FLOW OK")

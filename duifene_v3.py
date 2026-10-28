@@ -11,7 +11,7 @@ import ctypes
 try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except: pass
 
-import json, math, random, re, time, traceback, sys, platform, threading, os
+import json, math, random, re, ssl, time, traceback, sys, platform, threading, os
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -120,6 +120,7 @@ class Log:
         s._f = None
         s._path = None
         s._n = 0
+        s._tid = threading.get_ident()   # 主线程 id：界面控件只能在主线程碰
     def set(s, w): s._w = w
     def file(s):
         """把日志同时落到文件，出问题可以直接翻。"""
@@ -147,7 +148,8 @@ class Log:
                 if s._n % 20 == 0: s._f.flush()
             except Exception:
                 pass
-        if s._w:
+        if s._w and threading.get_ident() == s._tid:
+            # 推送线程（WS）也会打日志，tkinter 控件只能在主线程写，子线程只落盘
             tags = {"INFO": "info", "OK": "ok", "WARN": "warn", "ERROR": "error", "DEBUG": "debug"}
             try:
                 s._w.insert(tk.END, line + "\n", tags.get(lv))
@@ -1095,6 +1097,196 @@ class CI:
 
 
 
+# ── 服务端消息推送（SignalR）──────────────────────────────────────────────
+# 别人签到成功时，服务端会把他的 经度/纬度/距教室米数 广播给全站客户端。
+# 这是唯一能拿到「真圆心附近坐标」的免费途径：不用猜、不用三角测量、零额外请求。
+WS_HUB = "https://wsdf.duifene.com/messageHub"
+PEER_MAX_DIST_M = 150.0   # 广播里 Distance 超过它就不抄（那是别人瞎试的探测点）
+PEER_TTL_S = 180          # 抄来的坐标保留多久
+PEER_KEEP = 3             # 一次签到最多试几个同学的坐标
+WS_RS = "\x1e"            # SignalR 记录分隔符
+
+
+class Peer:
+    """别人签到时广播出来的真实坐标，按「距教室近」排队。"""
+
+    _pts = []
+    _lock = threading.Lock()
+
+    @classmethod
+    def add(cls, lng, lat, dist):
+        try:
+            lng, lat, dist = float(lng), float(lat), float(dist)
+        except (TypeError, ValueError):
+            return False
+        if not (73.0 <= lng <= 136.0 and 3.0 <= lat <= 54.0):
+            return False                      # 不是国内经纬度，多半是脏数据
+        if dist > PEER_MAX_DIST_M:
+            log.d(f"忽略广播坐标 {lng:.6f},{lat:.6f}（距教室 {dist:.0f} 米，太远）")
+            return False
+        now = time.time()
+        with cls._lock:
+            cls._pts = [p for p in cls._pts if now - p[3] < PEER_TTL_S]
+            for i, p in enumerate(cls._pts):
+                if abs(p[0] - lng) < 1e-6 and abs(p[1] - lat) < 1e-6:
+                    cls._pts[i] = (lng, lat, dist, now)
+                    break
+            else:
+                cls._pts.append((lng, lat, dist, now))
+            cls._pts.sort(key=lambda p: p[2])   # 距教室越近越靠前
+        log.i(f"收到同学坐标 {lng:.6f},{lat:.6f}（距教室 {dist:.0f} 米，签到会优先用它）")
+        return True
+
+    @classmethod
+    def best(cls, n=PEER_KEEP):
+        now = time.time()
+        with cls._lock:
+            return [(p[0], p[1]) for p in cls._pts if now - p[3] < PEER_TTL_S][:n]
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._pts = []
+
+
+class Hub:
+    """messageHub 的最小实现：连上、注册、收推送，断线自动重连。"""
+
+    def __init__(s):
+        s._ws = None
+        s._stop = threading.Event()
+        s._t = None
+        s._ok = False
+
+    def running(s):
+        return s._ok
+
+    def start(s, key_id=""):
+        if s._t and s._t.is_alive():
+            return
+        s._stop.clear()
+        s._t = threading.Thread(target=s._run, args=(_s(key_id),), daemon=True)
+        s._t.daemon = True
+        s._t.start()
+
+    def stop(s):
+        s._stop.set()
+        s._ok = False
+        try:
+            if s._ws:
+                s._ws.send(json.dumps({"type": 7}) + WS_RS)   # 优雅关闭
+        except Exception:
+            pass
+        try:
+            if s._ws:
+                s._ws.close()
+        except Exception:
+            pass
+        s._ws = None
+
+    def _send(s, obj):
+        if s._ws is None:
+            raise RuntimeError("WebSocket 未连接")
+        s._ws.send(json.dumps(obj, separators=(",", ":")) + WS_RS)
+
+    def _run(s, key_id):
+        try:
+            import websocket
+        except Exception as ex:
+            log.w(f"缺少 websocket-client，跟随同学坐标不可用（{ex}）")
+            return
+        delay = 1.0
+        while not s._stop.is_set():
+            try:
+                r = session.post(WS_HUB + "/negotiate?negotiateVersion=1",
+                                 headers={"Origin": HOST, "Referer": HOST + "/"}, timeout=10)
+                token = (r.json() or {}).get("connectionToken")
+                if not token:
+                    raise RuntimeError(f"negotiate 没有 token（HTTP {r.status_code}）")
+                s._ws = websocket.create_connection(
+                    WS_HUB.replace("https://", "wss://") + "?id=" + token,
+                    header=[f"Origin: {HOST}",
+                            f"User-Agent: {session.headers.get('User-Agent', '')}"],
+                    sslopt={"cert_reqs": ssl.CERT_NONE},
+                    timeout=20)
+                s._send({"protocol": "json", "version": 1})
+                s._ws.settimeout(10)
+                s._ws.recv()                                    # 握手回执 "{}"
+                if key_id:
+                    s._send({"type": 1, "invocationId": "1",
+                             "target": "connect", "arguments": [key_id]})
+                s._ok = True
+                delay = 1.0
+                log.i("消息推送已连接（同学签到成功后会广播坐标，可直接复用）")
+                s._read()
+            except Exception as ex:
+                s._ok = False
+                if s._stop.is_set():
+                    return
+                log.d(f"消息推送断开: {ex}（{delay:.0f} 秒后重连）")
+                s._stop.wait(delay)
+                delay = min(delay * 2, 30)
+            finally:
+                try:
+                    if s._ws:
+                        s._ws.close()
+                except Exception:
+                    pass
+                s._ws = None
+
+    def _read(s):
+        s._ws.settimeout(15)
+        while not s._stop.is_set():
+            try:
+                raw = s._ws.recv()
+            except Exception as ex:
+                if "timed out" in str(ex).lower() or "timeout" in str(ex).lower():
+                    s._send({"type": 6})                        # 心跳
+                    continue
+                raise
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            for part in raw.split(WS_RS):
+                part = part.strip()
+                if part:
+                    s._dispatch(part)
+
+    def _dispatch(s, part):
+        try:
+            msg = json.loads(part)
+        except Exception:
+            return
+        t = msg.get("type")
+        if t == 7:
+            raise RuntimeError("服务端关闭连接")
+        if t != 1:
+            return
+        args = msg.get("arguments") or []
+        if not args:
+            return
+        payload = args[0]
+        try:
+            d = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        except Exception:
+            return
+        uid = _s(d.get("UserID"))
+        lng, lat = d.get("Longitude"), d.get("Latitude")
+        if not (lng and lat):
+            return
+        if uid and uid == _s(CI.uid()):
+            return                                              # 自己签的，不用抄
+        try:
+            dist = float(d.get("Distance") or 0)
+        except (TypeError, ValueError):
+            dist = 0.0
+        Peer.add(lng, lat, dist)
+
+
+hub = Hub()
+
+
 def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
     """定位签到的候选圆心，按可信度排序。返回 [(标签, 经度, 纬度, 教室ID)]。
 
@@ -1116,6 +1308,10 @@ def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
         if key in seen: return
         seen.add(key)
         out.append((tag, lng, lat, room))
+
+    # 0 同学坐标：刚有同学签成功，服务端把他的点广播出来了，直接抄最稳
+    for plng, plat in Peer.best():
+        add("同学坐标", plng, plat)
 
     # 1 活动记录 / 教师页 hidden 域里带的中心：服务端自己记的点，最权威
     add("活动坐标", info.get("Longitude"), info.get("Latitude"))
@@ -1162,10 +1358,12 @@ class Loop:
         s._loc_logged = set()
         CI.reset(); CI.reset_uid()
         log.i(f"监听【{course_name}】签到, 延迟{delay}秒, 轮询{max(1, poll_ms // 1000)}秒")
+        hub.start(CI.uid() or "")
         s._poll()
 
     def stop(s):
         s.r = False; log.i("已停止")
+        hub.stop()
 
     def _next(s):
         if s.r and s._rt:
@@ -1752,6 +1950,11 @@ class App:
             else:
                 log.w(f"教室坐标: {rwhy}")
             cname = s._cv.get() if hasattr(s, "_cv") else ""
+            peers = Peer.best(99)
+            log.i(f"消息推送: {'已连接' if hub.running() else '未连接'}"
+                  f"；收到的同学坐标 {len(peers)} 个")
+            for i, (plng, plat) in enumerate(peers[:4], 1):
+                log.i(f"  {i}. 同学坐标 {plng},{plat}")
             cands = loc_candidates(cid, cname, {}, b3)
             log.i(f"圆心候选 {len(cands)} 个（签不上会依次换，不用你管）:")
             for i, (tag, cl, ca, _rm) in enumerate(cands, 1):
