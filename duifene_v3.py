@@ -730,9 +730,24 @@ class CI:
 
     @classmethod
     def pend(cls, rows, tried):
-        """挑出一条待签到的活动；tried 记录尝试次数与下次重试时间。"""
+        """挑出一条待签到的活动；tried 记录尝试次数与下次重试时间。
+
+        顺序上按 CreaterDate 从新到旧。服务端常常同时返回几条 StatusID=2 的
+        历史记录，而真正还在进行中的只有最新那条（参考项目的实测结论），旧记录
+        的 StatusID 根本不可信——照返回顺序取第一条，就会拿已经结束的活动反复
+        重试，白烧次数还容易撞限流。
+        """
         if not rows: return None
         now = datetime.now(); ts = time.time()
+
+        def _created(r):
+            try:
+                return datetime.strptime(_s(r.get("CreaterDate")), DATE_FMT)
+            except Exception:
+                return datetime.min
+        # 解析不出时间的排到最后，绝不因为格式怪就丢掉
+        rows = sorted(rows, key=_created, reverse=True)
+
         for r in rows:
             rid = _s(r.get("ID"))
             if not rid or rid in cls.done: continue
@@ -785,6 +800,72 @@ class CI:
             return False, f"签到异常: {ex}"
 
     @classmethod
+    def _qr_body(cls, r):
+        """解析 QrCodeCheckOK.aspx 的落地页，归一成 (是否成功, 文案)。
+
+        服务器把结论写在 DivOK 里，偶尔还会在 URL 上带个 t= 错误码，两个都看：
+            签到成功！/您已经签到成功！   → 成功
+            无法解读此签到二维码          → 令牌已换新（t=jx）
+            此签到二维码已过期            → 令牌过期（t=gq）
+            此二维码不是签到二维码        → 不是签到码（t=ce）
+            参数错误,请重新尝试           → 没带 state
+        """
+        body = r.text or ""
+        if Limiter.matched(body):
+            Limiter.trip()
+            return False, f"服务端限流，静默 {COOLDOWN_S} 秒"
+        code = ""
+        m = re.search(r"[?&]t=([A-Za-z0-9]+)", getattr(r, "url", "") or "")
+        if m:
+            code = m.group(1)
+        m2 = re.search(r'id="DivOK"[^>]*>(.*?)</div>\s*</div>', body, re.S)
+        raw = re.sub(r"<[^>]+>", " ", m2.group(1)) if m2 else ""
+        txt = " ".join((raw or BeautifulSoup(body, "html.parser")
+                        .get_text(" ", strip=True)).split())
+        if "成功" in txt and "未成功" not in txt:
+            if "已经" in txt or "已签到" in txt:
+                return True, "二维码签到成功（此前已签到）"
+            return True, "二维码签到成功"
+        if "无法解读" in txt:
+            dump_resp("qr_jx", r)
+            return False, "二维码无法解读（令牌已换新，需重取）"
+        if "过期" in txt or code == "gq":
+            dump_resp("qr_gq", r)
+            return False, "二维码已被刷新（令牌一次性，2~3 秒就换），要赶上最新那一张"
+        if "不是签到二维码" in txt or code == "ce":
+            dump_resp("qr_ce", r)
+            return False, "这个码不是签到码"
+        if "参数错误" in txt:
+            dump_resp("qr_bad", r)
+            return False, "二维码参数错误（链接不完整）"
+        return False, f"二维码未成功: {txt[:80] or code or '空响应'}"
+
+    @classmethod
+    def qr_state(cls, state):
+        """把签到活动 ID 直接当 state 提交。
+
+        参考项目（wh520-wh/wh-duifene-auto-sign）2026-06 的抓包实验：不同部署下
+        QrCodeCheckOK.aspx 的 state 有两种取值——
+          · 本机实测：state 是二维码里那串 48 位十六进制（与 G.aspx 的 e= 相同）；
+          · 他们的环境：state 就是轮询接口 getstudentinlogbyday 返回的签到记录 ID，
+            于是「拿活动 ID 直签」这一路完全不用取图、不用解码，也没有 2~3 秒
+            换一张图的竞态。
+        两种都要照顾，所以这里做成一试即走：成功就赚了，失败照旧回到取图解码。
+        """
+        st = _s(state)
+        if not st:
+            return False, "没有活动ID"
+        url = f"{HOST}/_CheckIn/MB/QrCodeCheckOK.aspx?state={quote(st, safe='')}"
+        try:
+            r = session.get(url, timeout=12, allow_redirects=True,
+                            headers={"Referer": STUDENT_REFERER})
+        except Exception as ex:
+            return False, f"活动ID直签异常: {ex}"
+        if r.status_code != 200:
+            return False, f"活动ID直签 HTTP {r.status_code}"
+        return cls._qr_body(r)
+
+    @classmethod
     def qr_link(cls, text):
         """按二维码里的令牌完成签到。
 
@@ -817,38 +898,10 @@ class CI:
                             headers={"Referer": STUDENT_REFERER})
             if r.status_code != 200:
                 return False, f"二维码请求失败 HTTP {r.status_code}"
-            body = r.text or ""
             hops = " → ".join("%s %s" % (h.status_code, (h.headers.get("Location") or "")[:70])
                               for h in (getattr(r, "history", None) or []))
             log.d("二维码跳转: %s" % (hops or "无 302"))
-            if Limiter.matched(body):
-                Limiter.trip()
-                return False, f"服务端限流，静默 {COOLDOWN_S} 秒"
-            code = ""
-            m = re.search(r"[?&]t=([A-Za-z0-9]+)", getattr(r, "url", "") or "")
-            if m:
-                code = m.group(1)
-            m2 = re.search(r'id="DivOK"[^>]*>(.*?)</div>\s*</div>', body, re.S)
-            raw = re.sub(r"<[^>]+>", " ", m2.group(1)) if m2 else ""
-            txt = " ".join((raw or BeautifulSoup(body, "html.parser")
-                            .get_text(" ", strip=True)).split())
-            if "成功" in txt and "未成功" not in txt:
-                if "已经" in txt or "已签到" in txt:
-                    return True, "二维码签到成功（此前已签到）"
-                return True, "二维码签到成功"
-            if "无法解读" in txt:
-                dump_resp("qr_jx", r)
-                return False, "二维码无法解读（令牌已换新，需重取）"
-            if "过期" in txt or code == "gq":
-                dump_resp("qr_gq", r)
-                return False, "二维码已被刷新（令牌一次性，2~3 秒就换），要赶上最新那一张"
-            if "不是签到二维码" in txt or code == "ce":
-                dump_resp("qr_ce", r)
-                return False, "这个码不是签到码"
-            if "参数错误" in txt:
-                dump_resp("qr_bad", r)
-                return False, "二维码参数错误（链接不完整）"
-            return False, f"二维码未成功: {txt[:80] or code or '空响应'}"
+            return cls._qr_body(r)
         except Exception as ex:
             return False, f"二维码异常: {ex}"
 
@@ -1432,13 +1485,14 @@ class Loop:
         s._tried = {}; s._poll_ms = POLL_BASE_MS; s._err = 0
         s._loc_logged = set()   # 教室坐标只打印一次，别每轮重试都刷屏
         s._loc_i_shown = {}     # 每个活动当前用第几个候选，用于打印「换圆心」
+        s._qr_direct = set()    # 试过「活动ID直签」的活动，别反复浪费请求
 
     def start(s, class_id, course_name, root_widget, course_id="", delay=0,
               poll_ms=POLL_BASE_MS):
         s.r = True; s.ci = class_id; s.cn = course_name; s._rt = root_widget
         s._cid = course_id; s._delay = delay; s._poll_ms = poll_ms
         s._pending = None; s._tick = 0; s._tried = {}; s._err = 0
-        s._loc_logged = set(); s._loc_i_shown = {}
+        s._loc_logged = set(); s._loc_i_shown = {}; s._qr_direct = set()
         CI.reset(); CI.reset_uid()
         log.i(f"监听【{course_name}】签到, 延迟{delay}秒, 轮询{max(1, poll_ms // 1000)}秒")
         hub.start(CI.uid() or "")
@@ -1609,6 +1663,18 @@ class Loop:
                 return False, f"拿不到汉字顺序：{CI.board_why()}；可在左侧填『手动码』"
             return CI.code(uid, ans)
         if ct == "2":
+            # 活动 ID 当 state 直签：参考项目实测在部分部署里 state 就是签到记录 ID，
+            # 这一路不用取图、不用解码，也没有「2~3 秒换一张图」的竞态。
+            # 本机实测 state 是二维码里的 48 位令牌，这么提交会被回「无法解读」，
+            # 所以每个活动只试一次，失败就老实回到取图解码。
+            rid = _s(info.get("ID"))
+            if rid and rid not in s._qr_direct:
+                s._qr_direct.add(rid)
+                ok, why = CI.qr_state(rid)
+                if ok:
+                    log.d("活动ID直签成功，省掉取图解码")
+                    return True, why
+                log.d(f"活动ID直签未通过: {why}（回退取图解码）")
             done, msg = CI.qr_fast(s._cid)
             if done is not None:
                 return done, msg

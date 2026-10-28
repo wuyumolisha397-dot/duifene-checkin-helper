@@ -34,3 +34,5 @@ _dev/*
 
 # 图标原图（微信导出，重生成用 icon_512.png 即可）
 assets/icon_src.jpg
+
+repo4/

@@ -1,5 +1,5 @@
 """教师页大屏通道：二维码 / 汉字 / 数字码 都能从 TeachCheckIn.aspx 自动取到。"""
-import sys, io, json, base64
+import sys, io, json, base64, re
 sys.path.insert(0, r"C:\Users\admin\WorkBuddy\2026-10-26-17-09-23")
 import duifene_v3 as d
 import qrcode
@@ -31,15 +31,19 @@ class R:
         return s._p if s._p is not None else {}
 
 
-STATE = {"board": None, "posts": [], "gets": []}
+STATE = {"board": None, "posts": [], "gets": [], "alive": set()}
 def fake_post(url, data=None, headers=None, timeout=None, **kw):
     if "TeachCheckIn.aspx" in url:
         return R(STATE["board"] or "")
     STATE["posts"].append((url, data))
     return R(json.dumps({"msg": 1, "msgbox": "签到成功"}), {"msg": 1, "msgbox": "签到成功"})
 def fake_get(url, **kw):
+    """只认 STATE["alive"] 里的 state，其余一律「无法解读」——跟真服务端一样。"""
     STATE["gets"].append(url)
-    return R('<html><div id="DivOK">签到成功</div></html>')
+    m = re.search(r"state=([0-9A-Za-z]+)", url)
+    if m and m.group(1) in STATE["alive"]:
+        return R('<html><div id="DivOK">签到成功</div></html>')
+    return R('<html><div id="DivOK">无法解读此签到二维码， 请扫描最新的签到二维码。</div></html>')
 
 d.session.post = fake_post
 d.session.get = fake_get
@@ -48,6 +52,7 @@ loop = d.Loop()
 loop._cid = "300001"; loop.ci = "505019"; loop.cn = "测试课程"
 
 # ── 1) 二维码：教师页给 base64 图片 → 识别 → 带 state 命中 QrCodeCheckOK ──
+STATE["alive"] = {TOKEN}      # 只有二维码里那个令牌是真 state（本机实测）
 STATE["board"] = board_html("2", QR_B64)
 b = d.CI.board("300001")
 assert b and b["type"] == "2" and len(b["key"]) > 100, "没解析出二维码 base64"
@@ -61,6 +66,15 @@ ok, msg = d.Loop._do(loop, "2", {})
 assert ok, f"二维码签到失败: {msg}"
 assert STATE["gets"] and f"state={TOKEN}" in STATE["gets"][-1], STATE["gets"][-1:]
 print("二维码自动签到 OK ->", STATE["gets"][-1][-46:])
+
+# ── 1b) 有些部署的 state 就是活动 ID：直签成功，连图都不用取 ──
+STATE["alive"] = {"2549900"}
+STATE["gets"] = []
+ok, msg = d.Loop._do(loop, "2", {"ID": "2549900"})
+assert ok, msg
+assert STATE["gets"][-1].endswith("state=2549900"), STATE["gets"][-1]
+print("活动ID直签 OK ->", STATE["gets"][-1][-24:])
+STATE["alive"] = {TOKEN}
 
 # ── 2) 汉字：大屏顺序直接提交 ──
 STATE["board"] = board_html("4", "春风化雨", "chun,chun,hua,yu")
