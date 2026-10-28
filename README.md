@@ -90,7 +90,7 @@ python -m venv .venv
 
 换楼上课、老师临时改地点，用第 2 条覆盖即可。
 
-**汉字**：`HFCheckCodeKey` 在 type=4 时直接就是正确顺序的 4 个字，不需要自己按拼音去排。
+**汉字**：`HFCheckCodeKey` 在 type=4 时直接就是正确顺序的 4 个字，不需要自己按拼音去排。提交时 `checkincode` 必须 percent-encode 成 UTF-8（`%E9%A0%94...`）：data 传的是 str，requests 原样交给 `http.client`，而它按 latin-1 发送，中文会直接抛 `UnicodeEncodeError`，签到根本发不出去。
 
 ## 目录
 

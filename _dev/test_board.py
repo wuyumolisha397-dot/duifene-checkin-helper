@@ -65,7 +65,7 @@ print("二维码自动签到 OK ->", STATE["gets"][-1][-46:])
 # ── 2) 汉字：大屏顺序直接提交 ──
 STATE["board"] = board_html("4", "春风化雨", "chun,chun,hua,yu")
 ok, msg = d.Loop._do(loop, "4", {})
-assert ok and "checkincode=春风化雨" in STATE["posts"][-1][1], STATE["posts"][-1]
+assert ok and "checkincode=%E6%98%A5%E9%A3%8E%E5%8C%96%E9%9B%A8" in STATE["posts"][-1][1], STATE["posts"][-1]
 print("汉字自动签到 OK ->", STATE["posts"][-1][1])
 
 # ── 3) 数字码：服务端没下发时从大屏取 ──

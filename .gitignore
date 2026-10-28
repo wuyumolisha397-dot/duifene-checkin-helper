@@ -12,6 +12,7 @@ __pycache__/
 # 克隆下来做参考的第三方仓库
 repo/
 repo2/
+repo3/
 
 # 本地工作区（项目笔记、缓存）
 .workbuddy/
@@ -24,6 +25,7 @@ _dev/*
 !_dev/test_toggle.py
 !_dev/test_closed.py
 !_dev/test_board.py
+!_dev/test_code.py
 !_dev/test_qr.py
 !_dev/test_loc.py
 !_dev/extract_icon.py

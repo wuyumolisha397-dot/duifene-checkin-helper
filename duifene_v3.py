@@ -19,6 +19,7 @@ from tkinter import messagebox, ttk
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote
 
 from bs4 import BeautifulSoup
 
@@ -762,7 +763,16 @@ class CI:
     # ── 各类签到 ──
     @classmethod
     def code(cls, uid, code):
-        """数字码 / 汉字：同一接口，checkincode 传 4 位数字或 4 个汉字。"""
+        """数字码 / 汉字：同一接口，checkincode 传 4 位数字或 4 个汉字。
+
+        汉字必须先 percent-encode。data 传的是 str，requests 原样交给
+        http.client，而它按 latin-1 编码发送——中文会直接抛
+        UnicodeEncodeError（"codec can't encode"），汉字签到因此从来没成功过。
+        """
+        code = _s(code)
+        # 一律 percent-encode：数字码 "1234" 编完还是 "1234"，不受影响；
+        # 汉字、空格、加号这些才会被正确转义
+        code = quote(code, safe="")
         try:
             h = {**FORM_H, "Referer": STUDENT_REFERER}
             r = session.post(HOST + "/_CheckIn/CheckIn.ashx",
