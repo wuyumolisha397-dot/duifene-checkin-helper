@@ -11,7 +11,7 @@ L._cid = "300001"; L.ci = "505019"; L.cn = "测试"
 
 closed_msg = "所在班级当前没有正在进行的签到，或者签到已结束！2026-10-26 18:00:32"
 calls = []
-d.Loop._do = lambda self, ct, p: (calls.append(ct), (False, closed_msg))[1]
+d.Loop._do = lambda self, ct, p, *a: (calls.append(ct), (False, closed_msg))[1]
 
 L._exec("3", {"ID": "2548484"}, "2548484")
 assert "2548484" in d.CI.done, "已关闭的活动必须被标记，否则会一直重试"
@@ -23,7 +23,7 @@ print("已关闭 -> 标记完成、不排重试  OK")
 for w in d.CLOSED_WORDS:
     d.CI.done = set()
     L._tried = {}
-    d.Loop._do = lambda self, ct, p, w=w: (False, f"服务端提示：{w}")
+    d.Loop._do = lambda self, ct, p, *a, w=w: (False, f"服务端提示：{w}")
     L._exec("1", {"ID": "x1", "CheckInCode": "1234"}, "x1")
     assert "x1" in d.CI.done, f"未识别关闭文案: {w}"
 print(f"关闭文案 {len(d.CLOSED_WORDS)} 种全部识别  OK")
@@ -31,7 +31,7 @@ print(f"关闭文案 {len(d.CLOSED_WORDS)} 种全部识别  OK")
 # ── 2. 可重试的失败（答案错 / 超范围）→ 继续重试 ──
 d.CI.done = set()
 L._tried = {}
-d.Loop._do = lambda self, ct, p: (False, "签到未成功")
+d.Loop._do = lambda self, ct, p, *a: (False, "签到未成功")
 L._exec("1", {"ID": "99", "CheckInCode": "1234"}, "99")
 assert "99" not in d.CI.done
 assert L._tried["99"]["next"] > time.time(), "可重试错误应安排下次重试"
@@ -45,7 +45,7 @@ print(f"重试参数 {d.MAX_TRIES} 次 × {d.RETRY_GAP_S}s  OK")
 # ── 4. 限流不重试，且不误判为关闭 ──
 d.CI.done = set()
 L._tried = {}
-d.Loop._do = lambda self, ct, p: (False, f"服务端限流，静默 {d.COOLDOWN_S} 秒")
+d.Loop._do = lambda self, ct, p, *a: (False, f"服务端限流，静默 {d.COOLDOWN_S} 秒")
 L._exec("1", {"ID": "77", "CheckInCode": "1234"}, "77")
 assert "77" not in d.CI.done, "限流不该把活动标记为完成"
 print("限流 -> 不标记、不误判  OK")

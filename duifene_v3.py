@@ -45,6 +45,8 @@ MAX_TRIES = 5             # 同一活动最多尝试次数
 MAX_TRIES_QR = 12         # 二维码单独放宽：图要等生成/刷新，窗口又只有 9~30 秒
 MAX_TRIES_LOC = 9         # 定位单独放宽：圆心不确定，要留出换候选点的次数
 LOC_MAX_CANDS = 5         # 定位最多换几个候选圆心（多了既超时又容易撞限流）
+LOC_TRIES_PER_CAND = 1    # 每个圆心只试 1 次就换：定位窗口只有 30 秒左右、重试又跟着 10 秒轮询走，
+                          # 一个点试两次就等于把另一个候选挤没了。候选用完会循环回来，不怕漏
 RETRY_GAP_S = 2           # 失败后间隔多久再试（签到窗口通常只有 10~30 秒，间隔必须短）
 COOLDOWN_S = 300          # 命中限流后的静默时长
 ROOM_CACHE_S = 600        # 教室坐标缓存时长（老师改教室前不用反复请求）
@@ -1335,9 +1337,16 @@ def loc_candidates(cid, cname, info, board=None, limit=LOC_MAX_CANDS):
             r["lng"], r["lat"], _s(r.get("roomid")))
     if not rooms and why:
         log.d("取教室坐标失败: %s" % why)
+    if hint and rooms and all(_s(r.get("roomid")) != hint for r in rooms):
+        # 签到活动绑的是哪间教室，只能从教师页 HFRoomID 看。对不上说明这份
+        # 教室表和老师建活动时用的不是一套（换了账号、教室被删、跨校区导入），
+        # 那就别信「就近那间」，全部当候选逐间试。
+        log.w(f"活动绑定的教室(HFRoomID={hint}) 不在你的教室列表里，逐间试")
 
-    # 5 兜底
-    add("兜底坐标", DEFAULT_LNG, DEFAULT_LAT)
+    # 5 兜底：只有一条候选都排不出来时才用。写死的默认点是「本机这个账号常用的
+    #   那个位置」，换个人、换门课就毫无意义，硬塞进列表只会白烧一次重试
+    if not out:
+        add("兜底坐标", DEFAULT_LNG, DEFAULT_LAT)
     return out[:limit]
 
 
@@ -1349,13 +1358,14 @@ class Loop:
         s._last_loc = None       # 本次定位实际提交的 (lng, lat, room)，成功后要回写
         s._tried = {}; s._poll_ms = POLL_BASE_MS; s._err = 0
         s._loc_logged = set()   # 教室坐标只打印一次，别每轮重试都刷屏
+        s._loc_i_shown = {}     # 每个活动当前用第几个候选，用于打印「换圆心」
 
     def start(s, class_id, course_name, root_widget, course_id="", delay=0,
               poll_ms=POLL_BASE_MS):
         s.r = True; s.ci = class_id; s.cn = course_name; s._rt = root_widget
         s._cid = course_id; s._delay = delay; s._poll_ms = poll_ms
         s._pending = None; s._tick = 0; s._tried = {}; s._err = 0
-        s._loc_logged = set()
+        s._loc_logged = set(); s._loc_i_shown = {}
         CI.reset(); CI.reset_uid()
         log.i(f"监听【{course_name}】签到, 延迟{delay}秒, 轮询{max(1, poll_ms // 1000)}秒")
         hub.start(CI.uid() or "")
@@ -1419,7 +1429,7 @@ class Loop:
         ct = _s(ct)
         limit = MAX_TRIES_QR if ct == "2" else (MAX_TRIES_LOC if ct == "3" else MAX_TRIES)
         info["count"] += 1
-        ok, msg = s._do(ct, p)
+        ok, msg = s._do(ct, p, info)
 
         if ok:
             CI.mark_done(rid)
@@ -1457,7 +1467,7 @@ class Loop:
         """本次活动的候选圆心（顺序见 loc_candidates）"""
         return loc_candidates(s._cid, s.cn, info, s._board_cached(info.get("ID")))
 
-    def _do(s, ct, info):
+    def _do(s, ct, info, st=None):
         uid = CI.uid()
         if not uid: return False, "无法获取用户ID"
         ct = _s(ct)
@@ -1471,21 +1481,26 @@ class Loop:
             if not code: return False, "服务端与教师页都没给出签到码"
             return CI.code(uid, code)
         if ct == "3":
-            # 圆心是黑盒，候选列表逐个试；失败下次自动换下一个
+            # 圆心是黑盒，候选列表逐个试。以前把「换到第几个」记在页面 dict 上，
+            # 而每次轮询都会重建那份 dict——于是换点永远从 0 开始，9 次重试全砸在
+            # 同一个点上（日志里候选明明有 2 个，却从没出现「换圆心」就是这原因）。
+            # 现在按 s._tried 里的真实重试次数推进，每个候选试 LOC_TRIES_PER_CAND 次。
             cands = s._loc_cands(info)
             if not cands:
                 return False, "没有任何可用坐标（活动、教室、人工校准都没有）"
-            i = int(info.get("loc_i") or 0)
-            if i >= len(cands): i = len(cands) - 1
+            n = max(1, int((st or {}).get("count") or 1))
+            i = ((n - 1) // max(1, LOC_TRIES_PER_CAND)) % len(cands)
             tag, lng, lat, room = cands[i]
-            info["loc_i"] = i + 1
             rid = _s(info.get("ID"))
-            if i == 0:
-                if rid not in s._loc_logged:
-                    s._loc_logged.add(rid)
-                    log.i(f"圆心: {tag} {lng},{lat}（候选 {len(cands)} 个，失败自动换）")
-            else:
+            if rid not in s._loc_logged:
+                s._loc_logged.add(rid)
+                lst = "；".join("%d.%s %s,%s" % (k + 1, c[0], c[1], c[2])
+                                for k, c in enumerate(cands))
+                log.i(f"圆心候选 {len(cands)} 个: {lst}")
+                log.i(f"先用 {tag} {lng},{lat}（每个试 {LOC_TRIES_PER_CAND} 次，不行自动换）")
+            elif s._loc_i_shown.get(rid, -1) != i:
                 log.w(f"换圆心 {i + 1}/{len(cands)}: {tag} {lng},{lat}")
+            s._loc_i_shown[rid] = i
             s._last_loc = (lng, lat, room)
             return CI.loc(uid, lng, lat, s._cid, s.ci, rid or s.cn)
         if ct == "4":

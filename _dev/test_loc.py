@@ -188,17 +188,16 @@ d.CI._rooms.clear(); loop._bc = None
 _ob = d.CI.board
 d.CI.board = lambda cid: {}
 try:
-    info = {"ID": "9300"}
+    # 按真实调用方式模拟：_exec 每轮把 count+1 再传进来，候选索引由 count 推出来
     seen = []
-    for _ in range(3):
-        d.Loop._do(loop, "3", info)
+    for k in range(1, 4):
+        d.Loop._do(loop, "3", {"ID": "9300"}, {"count": k, "next": 0})
         seen.append(loop._last_loc[:2])
     print("13 依次换圆心:", " -> ".join("%s,%s" % p for p in seen))
     assert len(set(seen)) == 3, seen                      # 三次三个不同点
     assert near(seen[0][0], "114.39"), seen[0]            # 第 1 次：上次成功点
     assert near(seen[1][0], "114.39525"), seen[1]         # 第 2 次：教室 往往
     assert near(seen[2][0], "114.39500"), seen[2]         # 第 3 次：教室 教学楼B
-    assert info["loc_i"] == 3, info
     print("13 圆心候选逐个换 OK（成功点 → 教室A → 教室B）")
 finally:
     d.CI.board = _ob
