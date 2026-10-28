@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, r"C:\Users\admin\WorkBuddy\2026-10-26-17-09-23")
 import duifene_v3 as d
+import os as _os; _os.environ["DUIFENE_LOG_DIR"] = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "_testlogs")
 
 fails = []
 def check(name, got, want):

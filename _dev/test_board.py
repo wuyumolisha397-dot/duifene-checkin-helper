@@ -2,6 +2,7 @@
 import sys, io, json, base64, re
 sys.path.insert(0, r"C:\Users\admin\WorkBuddy\2026-10-26-17-09-23")
 import duifene_v3 as d
+import os as _os; _os.environ["DUIFENE_LOG_DIR"] = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "_testlogs")
 import qrcode
 
 # ── 造一张真实二维码图片（base64 JPG），内容与老师大屏一致 ──

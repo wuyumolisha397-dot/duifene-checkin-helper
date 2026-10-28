@@ -107,7 +107,17 @@ CWE="#07c160"; CWA="#fdcb6e"
 
 
 def _log_dir():
-    """日志/取证目录：%LOCALAPPDATA%\\duifene，取不到就退回用户目录。"""
+    """日志/取证目录：%LOCALAPPDATA%\\duifene，取不到就退回用户目录。
+
+    `DUIFENE_LOG_DIR` 可以覆盖（_dev 下的测试用它，别把桩数据写进真实日志）。
+    """
+    ov = os.environ.get("DUIFENE_LOG_DIR")
+    if ov:
+        try:
+            os.makedirs(ov, exist_ok=True)
+            return ov
+        except Exception:
+            pass
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     d = os.path.join(base, "duifene", "logs")
     try:
@@ -514,13 +524,20 @@ def row_signed(r):
     return False
 
 
-def row_age_s(r):
-    """这条活动从发起到现在过了多少秒；解析不了返回 None。"""
+def row_created_at(r):
+    """这条活动是什么时候发起的；解析不了返回 None。"""
     try:
-        t = datetime.strptime(_s(r.get("CreaterDate")), DATE_FMT)
-        return max(0.0, (datetime.now() - t).total_seconds())
+        return datetime.strptime(_s(r.get("CreaterDate")), DATE_FMT)
     except Exception:
         return None
+
+
+def row_age_s(r):
+    """这条活动从发起到现在过了多少秒；解析不了返回 None。"""
+    t = row_created_at(r)
+    if t is None:
+        return None
+    return max(0.0, (datetime.now() - t).total_seconds())
 
 
 def board_dead(info, grace_s=BOARD_SYNC_GRACE_S):
@@ -1520,6 +1537,8 @@ class Loop:
         s._loc_logged = set()   # 教室坐标只打印一次，别每轮重试都刷屏
         s._loc_i_shown = {}     # 每个活动当前用第几个候选，用于打印「换圆心」
         s._qr_direct = set()    # 试过「活动ID直签」的活动，别反复浪费请求
+        s._t0 = None             # 本次点『开始监听』的时刻，用来判断活动是不是比监听还早
+        s._late_told = set()     # 已提示过「这条比监听还早」的活动
 
     def start(s, class_id, course_name, root_widget, course_id="", delay=0,
               poll_ms=POLL_BASE_MS):
@@ -1527,6 +1546,7 @@ class Loop:
         s._cid = course_id; s._delay = delay; s._poll_ms = poll_ms
         s._pending = None; s._tick = 0; s._tried = {}; s._err = 0
         s._loc_logged = set(); s._loc_i_shown = {}; s._qr_direct = set()
+        s._t0 = datetime.now(); s._late_told = set()
         CI.reset(); CI.reset_uid()
         log.i(f"监听【{course_name}】签到, 延迟{delay}秒, 轮询{max(1, poll_ms // 1000)}秒")
         hub.start(CI.uid() or "")
@@ -1569,10 +1589,27 @@ class Loop:
             log.e(f"监控异常: {ex}"); log.d(traceback.format_exc())
         s._next()
 
+    def _warn_if_late(s, p, rid):
+        """这条活动比「开始监听」还早 → 明说，别让人以为是取码坏了。
+
+        实测：先发起签到、后开监听，等程序发现它时那场常常已经收摊，大屏
+        HFChecktype 回到 0，于是只报「拿不到码」，看着像程序的锅，其实是去晚了。
+        """
+        if rid in s._late_told or not s._t0: return
+        t = row_created_at(p)
+        if not t or t >= s._t0: return
+        s._late_told.add(rid)
+        gap = int((s._t0 - t).total_seconds())
+        how = ("%d 分 %d 秒" % (gap // 60, gap % 60)) if gap >= 60 else ("%d 秒" % gap)
+        log.w(f"这条签到在你点『开始监听』之前 {how}就发起了——不是取不到码，是来晚了；"
+              f"数字码和大屏二维码只在活动进行中才给码。想签这场，"
+              f"必须在老师发起签到之前就先点『开始监听』。")
+
     def _dispatch(s, p):
         rid = _s(p.get("ID")); ct = _s(p.get("CheckInType"))
         log.i(f"发现待签到! ID:{rid} 类型:{TYPE_NAME.get(ct, ct or '?')}"
               + (f" 码:{_s(p.get('CheckInCode'))}" if _s(p.get("CheckInCode")) else ""))
+        s._warn_if_late(p, rid)
         if s._delay > 0 and not s._pending:
             s._pending = (ct, p, rid)
             log.i(f"将在 {s._delay} 秒后自动签到...")

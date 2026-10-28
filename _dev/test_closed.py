@@ -2,6 +2,7 @@
 import sys, time
 sys.path.insert(0, r"C:\Users\admin\WorkBuddy\2026-10-26-17-09-23")
 import duifene_v3 as d
+import os as _os; _os.environ["DUIFENE_LOG_DIR"] = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "_testlogs")
 
 # ── 1. 服务端说活动已结束 → 标记完成、不再重试 ──
 d.CI.done = set()
