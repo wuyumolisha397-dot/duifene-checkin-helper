@@ -59,9 +59,10 @@ LOC_NEAR_M = 12.0         # 定位签到落点：距教室中心最多这么多�
 # 补签窗口 ApplyLimitDate 只对教师端有效，学生端过了签到结束时间一律被拒。
 CLOSED_WORDS = ("已结束", "没有正在进行", "签到已截止", "活动不存在", "已过期")
 
-# 学生身份拿不到码：服务端按角色渲染大屏页，学生版只有一个 HFUserRole，
-# 整个 HFCheck* 域都不下发。这类失败等多久都没用，改提示别再空转。
-STUDENT_NO_CODE = "服务端只给这门课的教师下发签到码（当前账号是学生）"
+# 服务端按「账号身份」渲染大屏页：教师版才有 HFCheck* 域，学生版只有一个
+# HFUserRole。实测同一个账号在「自己建的课」和「以学生身份加入的课」上都拿到
+# 教师版，所以决定因素是账号，不是「你在这门课里是不是老师」。
+STUDENT_NO_CODE = "服务端只给「教师身份」的账号下发签到码（这个账号是学生）"
 
 # ── 持久化: Windows 用注册表, 其他平台用内存 ──
 if platform.system() == "Windows":
@@ -1090,9 +1091,7 @@ class CI:
                 # JS 也没有 endcheckin 这类教师动作。服务端是按角色渲染的，所以学生
                 # 无论等多久都等不到码，重试纯属白烧请求。
                 if "学生" in _s(f.get("HFUserRole")) and not f.get("HFChecktype"):
-                    cls.last_board = {
-                        "role": "student",
-                        "why": "服务端只给这门课的教师下发签到码（当前账号是学生）"}
+                    cls.last_board = {"role": "student", "why": STUDENT_NO_CODE}
                     cls._dump_board(r, course_id, "student")
                     return None
                 t = f.get("HFChecktype", "")
