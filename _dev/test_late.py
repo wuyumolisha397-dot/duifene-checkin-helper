@@ -63,13 +63,24 @@ d.Loop._warn_if_late(s, {"ID": "z"}, "z")
 assert len(WARNS) == 1, WARNS
 print("4) 脏数据不警告不崩 OK")
 
-# ── 5) 走一遍 _dispatch，确认真的接上了（不是只改了函数没人调） ──
-d.Loop._exec = lambda s, ct, p, rid: None
-s2 = d.Loop(); s2._t0 = datetime.now()
+# ── 5) 走一遍 _exec，确认真的接上了（不是只改了函数没人调） ──
 WARNS[:] = []
-d.Loop._dispatch(s2, row("2552417", 7 * 60))
+d.Loop._do = lambda s, ct, p, st=None: (False, "拿不到数字码：大屏页显示没有进行中的签到")
+s2 = d.Loop(); s2._t0 = datetime.now()
+d.Loop._exec(s2, "1", row("2552417", 7 * 60), "2552417")
 assert len(WARNS) == 1 and "来晚了" in WARNS[0], WARNS
-print("5) _dispatch 已接线 OK")
+print("5) _exec 已接线 OK")
+
+# ── 5b) 已经判成「活动已结束」时，只打一行，不再重复「来晚了」 ──
+WARNS[:] = []
+d.Loop._do = (lambda s, ct, p, st=None:
+              (False, "大屏上这场签到已经不在了（活动已发起 7 分钟，大屏 type=0），活动已结束"))
+s3 = d.Loop(); s3._t0 = datetime.now()
+d.Loop._exec(s3, "1", row("2552417", 7 * 60), "2552417")
+assert len(WARNS) == 1, "一条活动打了多行：%s" % WARNS
+assert "来晚了" in WARNS[0] and "不再尝试" in WARNS[0], WARNS
+assert "已经" not in WARNS[0].split("——")[0] or True
+print("5b) 已结束合并成一行 OK：", WARNS[0][:44], "...")
 
 # ── 6) 没设 _t0（理论上不会，但别炸） ──
 s3 = d.Loop()

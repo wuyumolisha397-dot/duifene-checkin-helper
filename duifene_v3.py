@@ -537,6 +537,12 @@ def row_created_at(r):
         return None
 
 
+def _dur(sec):
+    """秒数说成人话：'21 分 21 秒' / '40 秒'。"""
+    sec = int(sec)
+    return ("%d 分 %d 秒" % (sec // 60, sec % 60)) if sec >= 60 else ("%d 秒" % sec)
+
+
 def row_age_s(r):
     """这条活动从发起到现在过了多少秒；解析不了返回 None。"""
     t = row_created_at(r)
@@ -1607,19 +1613,25 @@ class Loop:
             log.e(f"监控异常: {ex}"); log.d(traceback.format_exc())
         s._next()
 
+    def _late_gap(s, p):
+        """这条活动比本次「开始监听」早多少秒；不是更早就返回 None。"""
+        t = row_created_at(p)
+        if not t or not s._t0 or t >= s._t0:
+            return None
+        return int((s._t0 - t).total_seconds())
+
     def _warn_if_late(s, p, rid):
         """这条活动比「开始监听」还早 → 明说，别让人以为是取码坏了。
 
         实测：先发起签到、后开监听，等程序发现它时那场常常已经收摊，大屏
         HFChecktype 回到 0，于是只报「拿不到码」，看着像程序的锅，其实是去晚了。
+        已经被判定「活动已结束」的那种由 _exec 合并成一句话，这里不再重复。
         """
-        if rid in s._late_told or not s._t0: return
-        t = row_created_at(p)
-        if not t or t >= s._t0: return
+        if rid in s._late_told: return
+        gap = s._late_gap(p)
+        if gap is None: return
         s._late_told.add(rid)
-        gap = int((s._t0 - t).total_seconds())
-        how = ("%d 分 %d 秒" % (gap // 60, gap % 60)) if gap >= 60 else ("%d 秒" % gap)
-        log.w(f"这条签到在你点『开始监听』之前 {how}就发起了——不是取不到码，是来晚了；"
+        log.w(f"这条签到在你点『开始监听』之前 {_dur(gap)}就发起了——不是取不到码，是来晚了；"
               f"数字码和大屏二维码只在活动进行中才给码。想签这场，"
               f"必须在老师发起签到之前就先点『开始监听』。")
 
@@ -1627,7 +1639,6 @@ class Loop:
         rid = _s(p.get("ID")); ct = _s(p.get("CheckInType"))
         log.i(f"发现待签到! ID:{rid} 类型:{TYPE_NAME.get(ct, ct or '?')}"
               + (f" 码:{_s(p.get('CheckInCode'))}" if _s(p.get("CheckInCode")) else ""))
-        s._warn_if_late(p, rid)
         if s._delay > 0 and not s._pending:
             s._pending = (ct, p, rid)
             log.i(f"将在 {s._delay} 秒后自动签到...")
@@ -1646,6 +1657,10 @@ class Loop:
         limit = MAX_TRIES_QR if ct == "2" else (MAX_TRIES_LOC if ct == "3" else MAX_TRIES)
         info["count"] += 1
         ok, msg = s._do(ct, p, info)
+        closed = any(w in (msg or "") for w in CLOSED_WORDS)
+        if not ok and not closed:
+            # 已结束的那种把「来晚了」并进下一行，别一条活动打两遍同样的话
+            s._warn_if_late(p, rid)
 
         if ok:
             CI.mark_done(rid)
@@ -1654,11 +1669,17 @@ class Loop:
                 LocMgr.mark_ok(s.cn, *s._last_loc)
                 s._last_loc = None
             log.ok(msg)
-        elif any(w in (msg or "") for w in CLOSED_WORDS):
+        elif closed:
             # 服务端已判定活动关闭：补签窗口（ApplyLimitDate）是教师端的，
             # 学生端再怎么重试也只会被拒，继续打接口纯属给自己招限流。
             CI.mark_done(rid)
-            log.w(f"{msg}（活动已关闭，本活动不再尝试；需补签请联系任课教师）")
+            gap = s._late_gap(p)
+            if gap is not None:
+                s._late_told.add(rid)
+                log.w(f"这场在你点『开始监听』之前 {_dur(gap)}就发起了，大屏上早已收摊——"
+                      f"不是取不到码，是来晚了。本活动不再尝试；需补签请联系任课教师")
+            else:
+                log.w(f"{msg}（活动已关闭，本活动不再尝试；需补签请联系任课教师）")
         elif info.pop("quiet", False):
             # 身份/权限问题不会自愈：不占重试次数，只把复查频率压到每分钟一次。
             # 之所以不直接放弃这场，是因为用户随时可能把大屏上的码填进『手动码』，
