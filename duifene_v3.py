@@ -59,6 +59,10 @@ LOC_NEAR_M = 12.0         # 定位签到落点：距教室中心最多这么多�
 # 补签窗口 ApplyLimitDate 只对教师端有效，学生端过了签到结束时间一律被拒。
 CLOSED_WORDS = ("已结束", "没有正在进行", "签到已截止", "活动不存在", "已过期")
 
+# 学生身份拿不到码：服务端按角色渲染大屏页，学生版只有一个 HFUserRole，
+# 整个 HFCheck* 域都不下发。这类失败等多久都没用，改提示别再空转。
+STUDENT_NO_CODE = "服务端只给这门课的教师下发签到码（当前账号是学生）"
+
 # ── 持久化: Windows 用注册表, 其他平台用内存 ──
 if platform.system() == "Windows":
     import winreg
@@ -1081,6 +1085,16 @@ class CI:
                     i = _s(e.get("id"))
                     if i.startswith("HF"):
                         f[i] = _s(e.get("value"))
+                # 学生身份的页面只有一个 HFUserRole（RoleName 就是「学生」），
+                # HFChecktype / HFCheckCodeKey / HFCheckInID 一个都不下发；页面里的
+                # JS 也没有 endcheckin 这类教师动作。服务端是按角色渲染的，所以学生
+                # 无论等多久都等不到码，重试纯属白烧请求。
+                if "学生" in _s(f.get("HFUserRole")) and not f.get("HFChecktype"):
+                    cls.last_board = {
+                        "role": "student",
+                        "why": "服务端只给这门课的教师下发签到码（当前账号是学生）"}
+                    cls._dump_board(r, course_id, "student")
+                    return None
                 t = f.get("HFChecktype", "")
                 info = {"type": t, "key": f.get("HFCheckCodeKey", ""),
                         "pinyin": f.get("HFCheckCodePinyin", ""),
@@ -1129,6 +1143,11 @@ class CI:
         t = _s(b.get("type")) or "0"
         if t == "0": return "大屏页显示没有进行中的签到（这场多半已经结束；老师没开大屏也会这样）"
         return f"大屏 type={t}、码={_s(b.get('key')) or '空'}"
+
+    @classmethod
+    def student_page(cls):
+        """上一次读到的大屏页是不是「学生版」——没有任何签到码域。"""
+        return _s((cls.last_board or {}).get("role")) == "student"
 
     @classmethod
     def hanzi_answer(cls, course_id):
@@ -1641,6 +1660,15 @@ class Loop:
             # 学生端再怎么重试也只会被拒，继续打接口纯属给自己招限流。
             CI.mark_done(rid)
             log.w(f"{msg}（活动已关闭，本活动不再尝试；需补签请联系任课教师）")
+        elif info.pop("quiet", False):
+            # 身份/权限问题不会自愈：不占重试次数，只把复查频率压到每分钟一次。
+            # 之所以不直接放弃这场，是因为用户随时可能把大屏上的码填进『手动码』，
+            # 那样下一轮轮询还能立刻用上。
+            info["count"] = max(0, info["count"] - 1)
+            info["next"] = time.time() + 60
+            if not info.get("told"):
+                info["told"] = True
+                log.w(f"{msg}（之后每分钟复查一次，不占重试次数）")
         else:
             info["next"] = time.time() + RETRY_GAP_S
             left = limit - info["count"]
@@ -1689,6 +1717,11 @@ class Loop:
                 dead = board_dead(info)
                 if dead:
                     return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
+                if CI.student_page():
+                    if st is not None:
+                        st["quiet"] = True   # 身份问题不会自愈，别按普通失败烧重试次数
+                    return False, (f"拿不到数字码：{STUDENT_NO_CODE}。"
+                                   f"看到大屏上的码就填到左栏『手动码』，填完自动用")
                 return False, f"拿不到数字码：{CI.board_why()}；可在左侧填『手动码』"
             if not code.isdigit():
                 log.d(f"签到码不是纯数字: {code!r}（仍按原样提交）")
@@ -1737,6 +1770,11 @@ class Loop:
                 dead = board_dead(info)
                 if dead:
                     return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
+                if CI.student_page():
+                    if st is not None:
+                        st["quiet"] = True
+                    return False, (f"拿不到汉字顺序：{STUDENT_NO_CODE}。"
+                                   f"把大屏上那 4 个字的顺序填到左栏『手动码』，填完自动用")
                 return False, f"拿不到汉字顺序：{CI.board_why()}；可在左侧填『手动码』"
             return CI.code(uid, ans)
         if ct == "2":
@@ -1759,6 +1797,11 @@ class Loop:
             dead = board_dead(info)
             if dead:
                 return False, f"大屏上这场签到已经不在了（{dead}），活动已结束"
+            if CI.student_page():
+                if st is not None:
+                    st["quiet"] = True
+                return False, (f"取不到二维码：{STUDENT_NO_CODE}。"
+                               f"请用手机对课堂大屏上的二维码扫一下（微信扫码即可）")
             return False, msg or "教师页上没有进行中的签到"
         return False, f"未知签到类型: {ct}"
 
